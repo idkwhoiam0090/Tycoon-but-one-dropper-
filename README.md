@@ -13,3 +13,6 @@ Custom Jump Power
 Anti-AFK Bypass
 Mod Detector
 Crates Farmed, Pails Farmed, Farm Time, and Up Time
+
+Script:
+loadstring(game:HttpGet("https://raw.githubusercontent.com/idkwhoiam0090/Tycoon-but-one-dropper-/main/Script.lua"))()
