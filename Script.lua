@@ -1,11 +1,11 @@
 --[[
     ========================================================================
-    TYCOON COLLECTIBLE FINDER - ULTIMATE AUTOMATION SCRIPT V7.0 (FULLY AUDITED)
+    TYCOON COLLECTIBLE FINDER - ULTIMATE AUTOMATION SCRIPT V8.1
     ========================================================================
     Location: StarterPlayer -> StarterPlayerScripts -> LocalScript
-    Purpose:  - Fully audited line-by-line verification
-              - Smooth, non-conflictive Additive WalkSpeed & JumpPower
-              - Working Auto-Farm, Waypoints, Toggles & Mod Detector
+    Purpose:  - Virtual Input Simulation for Quests, Daily, Spin, Rebirth & Cauldron
+              - Modern UI Redesign with Minimize & Right Shift Toggle
+              - Stable Additive WalkSpeed & JumpPower + Auto-Farm & Waypoints
     ========================================================================
 --]]
 
@@ -17,6 +17,7 @@ local PathfindingService = game:GetService("PathfindingService")
 local VirtualUser = game:GetService("VirtualUser")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local StarterGui = game:GetService("StarterGui")
+local VirtualInputManager = game:GetService("VirtualInputManager")
 
 local LocalPlayer = Players.LocalPlayer
 local Camera = workspace.CurrentCamera
@@ -62,7 +63,6 @@ local CONFIG = {
         AutoClaimDailyEnabled = false,
         ModDetectorEnabled = true,
         
-        -- Additive Player Stats & Brew Settings
         WalkSpeedEnabled = false,
         WalkSpeedBonus = 16,
         JumpPowerEnabled = false,
@@ -108,6 +108,7 @@ local State = {
     GuiInstance = nil,
     Views = {},
     StatsLabelRef = nil,
+    IsMinimized = false,
     
     LastAntiAfkTick = 0
 }
@@ -173,7 +174,7 @@ local function FormatTime(totalSeconds: number): string
 end
 
 --------------------------------------------------------------------------------
--- 4. AUTOMATION & BRIDGE LOOP
+-- 4. VIRTUAL INPUT & REMOTE AUTOMATION LOOP
 --------------------------------------------------------------------------------
 local function SendBridgeNetworkAction(actionNames)
     local targetRemotes = {ActionRemote, NetRemote, TrackRemote}
@@ -194,6 +195,27 @@ local function SendBridgeNetworkAction(actionNames)
     end
 end
 
+local function SimulateClickOnButton(btn)
+    if not btn or not (btn:IsA("TextButton") or btn:IsA("ImageButton")) then return end
+    pcall(function()
+        local absPos = btn.AbsolutePosition
+        local absSize = btn.AbsoluteSize
+        local centerX = absPos.X + (absSize.X / 2)
+        local centerY = absPos.Y + (absSize.Y / 2)
+
+        -- Use VirtualInputManager to send genuine click events
+        if VirtualInputManager then
+            VirtualInputManager:SendMouseButtonEvent(centerX, centerY, 0, true, game, 1)
+            task.wait(0.05)
+            VirtualInputManager:SendMouseButtonEvent(centerX, centerY, 0, false, game, 1)
+        else
+            VirtualUser:Button1Down(Vector2.new(centerX, centerY))
+            task.wait(0.05)
+            VirtualUser:Button1Up(Vector2.new(centerX, centerY))
+        end
+    end)
+end
+
 local function ClickButtonInstanceByPath(parentPath, buttonName)
     local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
     if not playerGui then return end
@@ -205,13 +227,27 @@ local function ClickButtonInstanceByPath(parentPath, buttonName)
     end
 
     local btn = targetFrame:FindFirstChild(buttonName)
-    if btn and (btn:IsA("TextButton") or btn:IsA("ImageButton")) then
-        pcall(function()
-            if getconnections then
-                for _, conn in ipairs(getconnections(btn.MouseButton1Click)) do conn:Fire() end
-                for _, conn in ipairs(getconnections(btn.Activated)) do conn:Fire() end
+    if btn then SimulateClickOnButton(btn) end
+end
+
+local function ScanAndClickKeywords(keywords)
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not playerGui then return end
+
+    for _, ui in ipairs(playerGui:GetDescendants()) do
+        if ui:IsA("TextButton") or ui:IsA("ImageButton") then
+            if ui.Visible and ui.AbsoluteSize.X > 0 and ui.AbsoluteSize.Y > 0 then
+                local btnText = ui:IsA("TextButton") and ui.Text:lower() or ""
+                local btnName = ui.Name:lower()
+
+                for _, kw in ipairs(keywords) do
+                    if string.find(btnText, kw) or string.find(btnName, kw) then
+                        SimulateClickOnButton(ui)
+                        break
+                    end
+                end
             end
-        end)
+        end
     end
 end
 
@@ -221,23 +257,27 @@ task.spawn(function()
         task.wait(1.5)
         pcall(function()
             if CONFIG.Settings.AutoRebirthEnabled then
-                SendBridgeNetworkAction({"Rebirth", "DoRebirth"})
+                SendBridgeNetworkAction({"Rebirth", "DoRebirth", "BuyRebirth"})
                 ClickButtonInstanceByPath({"HUD", "Main", "Left"}, "Rebirth")
+                ScanAndClickKeywords({"rebirth", "yes", "confirm"})
             end
 
             if CONFIG.Settings.AutoSpinWheelEnabled then
-                SendBridgeNetworkAction({"Spin", "FreeSpin", "SpinWheelFree"})
+                SendBridgeNetworkAction({"Spin", "FreeSpin", "SpinWheel", "DailySpin"})
                 ClickButtonInstanceByPath({"HUD", "Main", "Right"}, "Spin")
+                ScanAndClickKeywords({"spin", "free spin"})
             end
 
             if CONFIG.Settings.AutoClaimQuestsEnabled then
                 SendBridgeNetworkAction({"ClaimQuest", "CompleteQuest", "ClaimAll"})
                 ClickButtonInstanceByPath({"HUD", "Main", "Left"}, "Quests")
+                ScanAndClickKeywords({"claim", "complete", "collect", "reward"})
             end
 
             if CONFIG.Settings.AutoClaimDailyEnabled then
                 SendBridgeNetworkAction({"ClaimDaily", "DailyReward", "DailyClaim"})
                 ClickButtonInstanceByPath({"HUD", "Main", "Left"}, "Daily")
+                ScanAndClickKeywords({"claim", "collect", "take", "day"})
             end
 
             if CONFIG.Settings.AutoBrewEnabled and CONFIG.Settings.BrewsCompleted < CONFIG.Settings.BrewLimit then
@@ -248,12 +288,15 @@ task.spawn(function()
                             for _, desc in ipairs(obj:GetDescendants()) do
                                 if desc:IsA("ProximityPrompt") then
                                     pcall(function() fireproximityprompt(desc) end)
+                                elseif desc:IsA("ClickDetector") then
+                                    pcall(function() fireclickdetector(desc) end)
                                 end
                             end
                         end
                     end
                 end
-                SendBridgeNetworkAction({"BrewCauldron", "Brew", "StartBrew"})
+                SendBridgeNetworkAction({"BrewCauldron", "Brew", "StartBrew", "CraftCauldron"})
+                ScanAndClickKeywords({"brew", "cook", "craft", "start"})
                 CONFIG.Settings.BrewsCompleted = CONFIG.Settings.BrewsCompleted + 1
             end
         end)
@@ -273,7 +316,6 @@ local function ApplyPlayerModifications()
         State.HasCapturedOriginals = true
     end
 
-    -- Target WalkSpeed
     local targetSpeed = State.OriginalWalkSpeed
     if CONFIG.Settings.WalkSpeedEnabled then
         targetSpeed = State.OriginalWalkSpeed + CONFIG.Settings.WalkSpeedBonus
@@ -282,7 +324,6 @@ local function ApplyPlayerModifications()
         hum.WalkSpeed = targetSpeed
     end
 
-    -- Target JumpPower
     local targetJump = State.OriginalJumpPower
     if CONFIG.Settings.JumpPowerEnabled then
         targetJump = State.OriginalJumpPower + CONFIG.Settings.JumpPowerBonus
@@ -538,8 +579,8 @@ local function ApplyHighlight(itemData)
 
             local label = Instance.new("TextLabel")
             label.Size = UDim2.new(1, 0, 1, 0)
-            label.BackgroundTransparency = 0.5
-            label.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+            label.BackgroundTransparency = 0.4
+            label.BackgroundColor3 = Color3.fromRGB(18, 19, 24)
             label.TextColor3 = color
             label.Font = Enum.Font.SourceSansBold
             label.TextSize = 13
@@ -549,7 +590,7 @@ local function ApplyHighlight(itemData)
             label.Text = itemData.Name .. distText
             label.Parent = bb
             CreateCorner(label, 6)
-            CreateStroke(label, Color3.fromRGB(60, 60, 70), 1)
+            CreateStroke(label, Color3.fromRGB(50, 52, 62), 1)
 
             bb.Parent = inst
             State.BillboardGuis[inst] = bb
@@ -682,7 +723,7 @@ local function CreateWaypointUI()
     arrowIcon.Size = UDim2.new(1, 0, 1, 0)
     arrowIcon.BackgroundTransparency = 1
     arrowIcon.Text = "▲"
-    arrowIcon.TextColor3 = Color3.fromRGB(255, 220, 0)
+    arrowIcon.TextColor3 = Color3.fromRGB(255, 204, 0)
     arrowIcon.TextSize = 28
     arrowIcon.Font = Enum.Font.SourceSansBold
     arrowIcon.Parent = ArrowFrame
@@ -691,7 +732,7 @@ local function CreateWaypointUI()
     DistanceText.Size = UDim2.new(0, 100, 0, 20)
     DistanceText.Position = UDim2.new(0.5, -50, 1, 2)
     DistanceText.BackgroundTransparency = 0.5
-    DistanceText.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
+    DistanceText.BackgroundColor3 = Color3.fromRGB(15, 16, 20)
     DistanceText.TextColor3 = Color3.fromRGB(255, 255, 255)
     DistanceText.TextSize = 12
     DistanceText.Font = Enum.Font.SourceSansBold
@@ -733,7 +774,7 @@ local function UpdateWaypointTracking()
 end
 
 --------------------------------------------------------------------------------
--- 11. UNLOAD / CLEANUP SCRIPT (REVERTS ORIGINAL STATS)
+-- 11. UNLOAD & CLEANUP
 --------------------------------------------------------------------------------
 local function UnloadScript()
     for _, conn in ipairs(State.Connections) do
@@ -769,7 +810,7 @@ local function UnloadScript()
 end
 
 --------------------------------------------------------------------------------
--- 12. MAIN GUI CONSTRUCTION & TABS
+-- 12. MODERN GUI CONSTRUCTION & KEYBINDS
 --------------------------------------------------------------------------------
 local PopulateFinderList
 
@@ -778,7 +819,7 @@ local function SwitchTab(targetTab)
     for tabName, viewFrame in pairs(State.Views) do
         viewFrame.Visible = (tabName == targetTab)
     end
-    if tabName == "Finder" then
+    if targetTab == "Finder" then
         PopulateFinderList()
     end
 end
@@ -795,21 +836,21 @@ local function BuildGUI()
 
     local main = Instance.new("Frame")
     main.Name = "MainWindow"
-    main.Size = UDim2.new(0, 440, 0, 400)
-    main.Position = UDim2.new(0.5, -220, 0.5, -200)
-    main.BackgroundColor3 = Color3.fromRGB(24, 25, 29)
+    main.Size = UDim2.new(0, 460, 0, 410)
+    main.Position = UDim2.new(0.5, -230, 0.5, -205)
+    main.BackgroundColor3 = Color3.fromRGB(18, 19, 24)
     main.ClipsDescendants = true
     main.Parent = screenGui
 
-    CreateCorner(main, 10)
-    CreateStroke(main, Color3.fromRGB(45, 48, 56), 1.5)
+    CreateCorner(main, 12)
+    CreateStroke(main, Color3.fromRGB(50, 53, 65), 1.5)
 
     -- Title Bar
     local titleBar = Instance.new("Frame")
-    titleBar.Size = UDim2.new(1, 0, 0, 36)
-    titleBar.BackgroundColor3 = Color3.fromRGB(32, 34, 40)
+    titleBar.Size = UDim2.new(1, 0, 0, 38)
+    titleBar.BackgroundColor3 = Color3.fromRGB(26, 28, 35)
     titleBar.Parent = main
-    CreateCorner(titleBar, 10)
+    CreateCorner(titleBar, 12)
 
     local dragging, dragStart, startPos
     titleBar.InputBegan:Connect(function(input)
@@ -831,60 +872,101 @@ local function BuildGUI()
 
     local titleText = Instance.new("TextLabel")
     titleText.Size = UDim2.new(0.6, 0, 1, 0)
-    titleText.Position = UDim2.new(0, 12, 0, 0)
+    titleText.Position = UDim2.new(0, 14, 0, 0)
     titleText.BackgroundTransparency = 1
-    titleText.Text = "Tycoon Collectible Finder"
-    titleText.TextColor3 = Color3.fromRGB(240, 240, 245)
-    titleText.Font = Enum.Font.SourceSansBold
-    titleText.TextSize = 15
+    titleText.Text = "Tycoon Pro Automation"
+    titleText.TextColor3 = Color3.fromRGB(245, 245, 250)
+    titleText.Font = Enum.Font.GothamBold
+    titleText.TextSize = 14
     titleText.TextXAlignment = Enum.TextXAlignment.Left
     titleText.Parent = titleBar
 
+    -- Minimize & Close Buttons
     local closeBtn = Instance.new("TextButton")
     closeBtn.Size = UDim2.new(0, 28, 0, 28)
     closeBtn.Position = UDim2.new(1, -32, 0.5, -14)
-    closeBtn.BackgroundTransparency = 1
+    closeBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
     closeBtn.Text = "✕"
-    closeBtn.TextColor3 = Color3.fromRGB(220, 80, 80)
-    closeBtn.TextSize = 14
+    closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    closeBtn.Font = Enum.Font.GothamBold
+    closeBtn.TextSize = 12
     closeBtn.Parent = titleBar
+    CreateCorner(closeBtn, 6)
 
     closeBtn.MouseButton1Click:Connect(function()
         UnloadScript()
     end)
 
+    local minBtn = Instance.new("TextButton")
+    minBtn.Size = UDim2.new(0, 28, 0, 28)
+    minBtn.Position = UDim2.new(1, -66, 0.5, -14)
+    minBtn.BackgroundColor3 = Color3.fromRGB(45, 48, 60)
+    minBtn.Text = "–"
+    minBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    minBtn.Font = Enum.Font.GothamBold
+    minBtn.TextSize = 14
+    minBtn.Parent = titleBar
+    CreateCorner(minBtn, 6)
+
+    local contentHolder = Instance.new("Frame")
+    contentHolder.Name = "ContentHolder"
+    contentHolder.Size = UDim2.new(1, 0, 1, -38)
+    contentHolder.Position = UDim2.new(0, 0, 0, 38)
+    contentHolder.BackgroundTransparency = 1
+    contentHolder.Parent = main
+
+    minBtn.MouseButton1Click:Connect(function()
+        State.IsMinimized = not State.IsMinimized
+        if State.IsMinimized then
+            main.Size = UDim2.new(0, 460, 0, 38)
+            contentHolder.Visible = false
+            minBtn.Text = "+"
+        else
+            main.Size = UDim2.new(0, 460, 0, 410)
+            contentHolder.Visible = true
+            minBtn.Text = "–"
+        end
+    end)
+
+    -- Right Shift Keybind Toggle
+    UserInputService.InputBegan:Connect(function(input, gameProcessed)
+        if not gameProcessed and input.KeyCode == Enum.KeyCode.RightShift then
+            main.Visible = not main.Visible
+        end
+    end)
+
     -- Navigation Bar Buttons (5 Tabs)
     local navBar = Instance.new("Frame")
-    navBar.Size = UDim2.new(1, -20, 0, 30)
-    navBar.Position = UDim2.new(0, 10, 0, 44)
-    navBar.BackgroundColor3 = Color3.fromRGB(18, 19, 22)
-    navBar.Parent = main
+    navBar.Size = UDim2.new(1, -20, 0, 32)
+    navBar.Position = UDim2.new(0, 10, 0, 10)
+    navBar.BackgroundColor3 = Color3.fromRGB(13, 14, 18)
+    navBar.Parent = contentHolder
     CreateCorner(navBar, 6)
 
     local contentFrame = Instance.new("Frame")
     contentFrame.Name = "ContentFrame"
-    contentFrame.Size = UDim2.new(1, -20, 1, -148)
-    contentFrame.Position = UDim2.new(0, 10, 0, 80)
+    contentFrame.Size = UDim2.new(1, -20, 1, -104)
+    contentFrame.Position = UDim2.new(0, 10, 0, 50)
     contentFrame.BackgroundTransparency = 1
-    contentFrame.Parent = main
+    contentFrame.Parent = contentHolder
 
     local tabButtons = {}
     local function CreateTabButton(name, text, widthScale, xPos)
         local btn = Instance.new("TextButton")
         btn.Size = UDim2.new(widthScale, -2, 1, 0)
         btn.Position = xPos
-        btn.BackgroundColor3 = State.ActiveTab == name and Color3.fromRGB(45, 48, 58) or Color3.fromRGB(25, 27, 32)
+        btn.BackgroundColor3 = State.ActiveTab == name and Color3.fromRGB(45, 48, 60) or Color3.fromRGB(20, 22, 28)
         btn.Text = text
         btn.TextColor3 = Color3.fromRGB(220, 220, 230)
-        btn.Font = Enum.Font.SourceSansBold
-        btn.TextSize = 10
+        btn.Font = Enum.Font.GothamBold
+        btn.TextSize = 11
         btn.Parent = navBar
-        CreateCorner(btn, 4)
+        CreateCorner(btn, 5)
         tabButtons[name] = btn
 
         btn.MouseButton1Click:Connect(function()
-            for _, b in pairs(tabButtons) do b.BackgroundColor3 = Color3.fromRGB(25, 27, 32) end
-            btn.BackgroundColor3 = Color3.fromRGB(45, 48, 58)
+            for _, b in pairs(tabButtons) do b.BackgroundColor3 = Color3.fromRGB(20, 22, 28) end
+            btn.BackgroundColor3 = Color3.fromRGB(45, 48, 60)
             SwitchTab(name)
         end)
     end
@@ -897,19 +979,19 @@ local function BuildGUI()
 
     -- LIVE STATS TRACKER PANEL
     local statsPanel = Instance.new("Frame")
-    statsPanel.Size = UDim2.new(1, 0, 0, 40)
-    statsPanel.Position = UDim2.new(0, 10, 1, -48)
-    statsPanel.BackgroundColor3 = Color3.fromRGB(18, 19, 22)
-    statsPanel.Parent = main
+    statsPanel.Size = UDim2.new(1, -20, 0, 36)
+    statsPanel.Position = UDim2.new(0, 10, 1, -44)
+    statsPanel.BackgroundColor3 = Color3.fromRGB(13, 14, 18)
+    statsPanel.Parent = contentHolder
     CreateCorner(statsPanel, 6)
-    CreateStroke(statsPanel, Color3.fromRGB(40, 42, 50), 1)
+    CreateStroke(statsPanel, Color3.fromRGB(35, 37, 46), 1)
 
     local statsLabel = Instance.new("TextLabel")
     statsLabel.Size = UDim2.new(1, -10, 1, 0)
     statsLabel.Position = UDim2.new(0, 5, 0, 0)
     statsLabel.BackgroundTransparency = 1
-    statsLabel.TextColor3 = Color3.fromRGB(200, 200, 210)
-    statsLabel.Font = Enum.Font.SourceSansBold
+    statsLabel.TextColor3 = Color3.fromRGB(190, 190, 200)
+    statsLabel.Font = Enum.Font.GothamBold
     statsLabel.TextSize = 11
     statsLabel.TextWrapped = true
     statsLabel.Text = "Crates: 0 | Pails: 0 | Farm: 00:00 | Runtime: 00:00"
@@ -931,17 +1013,17 @@ local function BuildGUI()
 
     local autoFarmToggle = Instance.new("TextButton")
     autoFarmToggle.Size = UDim2.new(0.48, 0, 1, 0)
-    autoFarmToggle.BackgroundColor3 = CONFIG.Settings.AutoFarmEnabled and Color3.fromRGB(50, 180, 80) or Color3.fromRGB(180, 60, 60)
+    autoFarmToggle.BackgroundColor3 = CONFIG.Settings.AutoFarmEnabled and Color3.fromRGB(46, 160, 67) or Color3.fromRGB(200, 50, 50)
     autoFarmToggle.Text = "AUTO-FARM: " .. (CONFIG.Settings.AutoFarmEnabled and "ON" or "OFF")
     autoFarmToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
-    autoFarmToggle.Font = Enum.Font.SourceSansBold
-    autoFarmToggle.TextSize = 12
+    autoFarmToggle.Font = Enum.Font.GothamBold
+    autoFarmToggle.TextSize = 11
     autoFarmToggle.Parent = controlsBar
-    CreateCorner(autoFarmToggle, 4)
+    CreateCorner(autoFarmToggle, 6)
 
     autoFarmToggle.MouseButton1Click:Connect(function()
         CONFIG.Settings.AutoFarmEnabled = not CONFIG.Settings.AutoFarmEnabled
-        autoFarmToggle.BackgroundColor3 = CONFIG.Settings.AutoFarmEnabled and Color3.fromRGB(50, 180, 80) or Color3.fromRGB(180, 60, 60)
+        autoFarmToggle.BackgroundColor3 = CONFIG.Settings.AutoFarmEnabled and Color3.fromRGB(46, 160, 67) or Color3.fromRGB(200, 50, 50)
         autoFarmToggle.Text = "AUTO-FARM: " .. (CONFIG.Settings.AutoFarmEnabled and "ON" or "OFF")
         
         if CONFIG.Settings.AutoFarmEnabled then
@@ -958,13 +1040,13 @@ local function BuildGUI()
     local filterBtn = Instance.new("TextButton")
     filterBtn.Size = UDim2.new(0.24, -4, 1, 0)
     filterBtn.Position = UDim2.new(0.5, 2, 0, 0)
-    filterBtn.BackgroundColor3 = Color3.fromRGB(35, 37, 44)
+    filterBtn.BackgroundColor3 = Color3.fromRGB(30, 33, 42)
     filterBtn.Text = "Filter: All"
     filterBtn.TextColor3 = Color3.fromRGB(200, 200, 210)
-    filterBtn.Font = Enum.Font.SourceSans
-    filterBtn.TextSize = 12
+    filterBtn.Font = Enum.Font.Gotham
+    filterBtn.TextSize = 11
     filterBtn.Parent = controlsBar
-    CreateCorner(filterBtn, 4)
+    CreateCorner(filterBtn, 6)
 
     filterBtn.MouseButton1Click:Connect(function()
         if State.CategoryFilter == "All" then State.CategoryFilter = "MysteryCrate"
@@ -977,13 +1059,13 @@ local function BuildGUI()
     local scanBtn = Instance.new("TextButton")
     scanBtn.Size = UDim2.new(0.24, -2, 1, 0)
     scanBtn.Position = UDim2.new(0.76, 2, 0, 0)
-    scanBtn.BackgroundColor3 = Color3.fromRGB(45, 90, 180)
+    scanBtn.BackgroundColor3 = Color3.fromRGB(31, 111, 235)
     scanBtn.Text = "Scan"
     scanBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    scanBtn.Font = Enum.Font.SourceSansBold
-    scanBtn.TextSize = 12
+    scanBtn.Font = Enum.Font.GothamBold
+    scanBtn.TextSize = 11
     scanBtn.Parent = controlsBar
-    CreateCorner(scanBtn, 4)
+    CreateCorner(scanBtn, 6)
 
     scanBtn.MouseButton1Click:Connect(function()
         ScanForCollectibles()
@@ -1021,8 +1103,8 @@ local function BuildGUI()
     wpInfoLabel.Size = UDim2.new(1, 0, 0, 60)
     wpInfoLabel.Position = UDim2.new(0, 0, 0, 10)
     wpInfoLabel.BackgroundTransparency = 1
-    wpInfoLabel.Font = Enum.Font.SourceSansBold
-    wpInfoLabel.TextSize = 14
+    wpInfoLabel.Font = Enum.Font.GothamBold
+    wpInfoLabel.TextSize = 13
     wpInfoLabel.TextColor3 = Color3.fromRGB(220, 220, 230)
     wpInfoLabel.Text = "No target selected.\nClick 'Track & Go' in Finder or enable Auto-Farm."
     wpInfoLabel.Parent = waypointsView
@@ -1030,11 +1112,11 @@ local function BuildGUI()
     local clearBtn = Instance.new("TextButton")
     clearBtn.Size = UDim2.new(0.6, 0, 0, 36)
     clearBtn.Position = UDim2.new(0.2, 0, 0.6, -18)
-    clearBtn.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
+    clearBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
     clearBtn.Text = "Stop Auto-Walking"
     clearBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    clearBtn.Font = Enum.Font.SourceSansBold
-    clearBtn.TextSize = 13
+    clearBtn.Font = Enum.Font.GothamBold
+    clearBtn.TextSize = 12
     clearBtn.Parent = waypointsView
     CreateCorner(clearBtn, 6)
 
@@ -1042,7 +1124,7 @@ local function BuildGUI()
         State.CurrentTrackedTarget = nil
         State.AutoWalkEnabled = false
         CONFIG.Settings.AutoFarmEnabled = false
-        autoFarmToggle.BackgroundColor3 = Color3.fromRGB(180, 60, 60)
+        autoFarmToggle.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
         autoFarmToggle.Text = "AUTO-FARM: OFF"
         StopAutoWalk()
         wpInfoLabel.Text = "Target cleared.\nClick 'Track & Go' in Finder or enable Auto-Farm."
@@ -1061,39 +1143,39 @@ local function BuildGUI()
 
     local function CreateGrindingToggle(parentView, name, yPos, configKey)
         local lbl = Instance.new("TextLabel")
-        lbl.Size = UDim2.new(0.65, 0, 0, 24)
+        lbl.Size = UDim2.new(0.65, 0, 0, 26)
         lbl.Position = UDim2.new(0, 0, 0, yPos)
         lbl.BackgroundTransparency = 1
         lbl.Text = name
         lbl.TextColor3 = Color3.fromRGB(220, 220, 230)
-        lbl.Font = Enum.Font.SourceSansBold
+        lbl.Font = Enum.Font.GothamBold
         lbl.TextSize = 12
         lbl.TextXAlignment = Enum.TextXAlignment.Left
         lbl.Parent = parentView
 
         local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(0, 56, 0, 24)
-        btn.Position = UDim2.new(1, -56, 0, yPos)
-        btn.BackgroundColor3 = CONFIG.Settings[configKey] and Color3.fromRGB(50, 180, 80) or Color3.fromRGB(180, 50, 50)
+        btn.Size = UDim2.new(0, 60, 0, 26)
+        btn.Position = UDim2.new(1, -60, 0, yPos)
+        btn.BackgroundColor3 = CONFIG.Settings[configKey] and Color3.fromRGB(46, 160, 67) or Color3.fromRGB(200, 50, 50)
         btn.Text = CONFIG.Settings[configKey] and "ON" or "OFF"
         btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-        btn.Font = Enum.Font.SourceSansBold
-        btn.TextSize = 12
+        btn.Font = Enum.Font.GothamBold
+        btn.TextSize = 11
         btn.Parent = parentView
-        CreateCorner(btn, 4)
+        CreateCorner(btn, 6)
 
         btn.MouseButton1Click:Connect(function()
             CONFIG.Settings[configKey] = not CONFIG.Settings[configKey]
-            btn.BackgroundColor3 = CONFIG.Settings[configKey] and Color3.fromRGB(50, 180, 80) or Color3.fromRGB(180, 50, 50)
+            btn.BackgroundColor3 = CONFIG.Settings[configKey] and Color3.fromRGB(46, 160, 67) or Color3.fromRGB(200, 50, 50)
             btn.Text = CONFIG.Settings[configKey] and "ON" or "OFF"
         end)
     end
 
     CreateGrindingToggle(grindingView, "Auto Rebirth", 5, "AutoRebirthEnabled")
-    CreateGrindingToggle(grindingView, "Auto Spin Wheel", 35, "AutoSpinWheelEnabled")
-    CreateGrindingToggle(grindingView, "Auto Claim Quests", 65, "AutoClaimQuestsEnabled")
-    CreateGrindingToggle(grindingView, "Auto Claim Daily", 95, "AutoClaimDailyEnabled")
-    CreateGrindingToggle(grindingView, "Auto Brew Cauldron", 125, "AutoBrewEnabled")
+    CreateGrindingToggle(grindingView, "Auto Spin Wheel", 38, "AutoSpinWheelEnabled")
+    CreateGrindingToggle(grindingView, "Auto Claim Quests", 71, "AutoClaimQuestsEnabled")
+    CreateGrindingToggle(grindingView, "Auto Claim Daily", 104, "AutoClaimDailyEnabled")
+    CreateGrindingToggle(grindingView, "Auto Brew Cauldron", 137, "AutoBrewEnabled")
 
     -- VIEW 4: PLAYER MODIFICATIONS (SPEED & JUMP BONUS)
     local playerView = Instance.new("ScrollingFrame")
@@ -1101,7 +1183,7 @@ local function BuildGUI()
     playerView.Size = UDim2.new(1, 0, 1, 0)
     playerView.BackgroundTransparency = 1
     playerView.Visible = false
-    playerView.CanvasSize = UDim2.new(0, 0, 0, 140)
+    playerView.CanvasSize = UDim2.new(0, 0, 0, 150)
     playerView.ScrollBarThickness = 4
     playerView.Parent = contentFrame
     State.Views["Player"] = playerView
@@ -1110,25 +1192,25 @@ local function BuildGUI()
     
     local speedSliderLbl = Instance.new("TextLabel")
     speedSliderLbl.Size = UDim2.new(1, 0, 0, 18)
-    speedSliderLbl.Position = UDim2.new(0, 0, 0, 35)
+    speedSliderLbl.Position = UDim2.new(0, 0, 0, 36)
     speedSliderLbl.BackgroundTransparency = 1
     speedSliderLbl.Text = "Speed Bonus: +" .. CONFIG.Settings.WalkSpeedBonus .. " (0 - 100)"
     speedSliderLbl.TextColor3 = Color3.fromRGB(170, 170, 180)
-    speedSliderLbl.Font = Enum.Font.SourceSans
+    speedSliderLbl.Font = Enum.Font.Gotham
     speedSliderLbl.TextSize = 11
     speedSliderLbl.TextXAlignment = Enum.TextXAlignment.Left
     speedSliderLbl.Parent = playerView
 
     local speedBar = Instance.new("Frame")
     speedBar.Size = UDim2.new(1, 0, 0, 10)
-    speedBar.Position = UDim2.new(0, 0, 0, 55)
-    speedBar.BackgroundColor3 = Color3.fromRGB(40, 43, 52)
+    speedBar.Position = UDim2.new(0, 0, 0, 56)
+    speedBar.BackgroundColor3 = Color3.fromRGB(30, 33, 42)
     speedBar.Parent = playerView
     CreateCorner(speedBar, 5)
 
     local speedFill = Instance.new("Frame")
     speedFill.Size = UDim2.new(CONFIG.Settings.WalkSpeedBonus / 100, 0, 1, 0)
-    speedFill.BackgroundColor3 = Color3.fromRGB(50, 140, 220)
+    speedFill.BackgroundColor3 = Color3.fromRGB(31, 111, 235)
     speedFill.Parent = speedBar
     CreateCorner(speedFill, 5)
 
@@ -1149,24 +1231,24 @@ local function BuildGUI()
         end
     end)
 
-    local jumpToggleY = 80
+    local jumpToggleY = 82
     CreateGrindingToggle(playerView, "Enable Custom Jump (+)", jumpToggleY, "JumpPowerEnabled")
 
     local jumpSliderLbl = Instance.new("TextLabel")
     jumpSliderLbl.Size = UDim2.new(1, 0, 0, 18)
-    jumpSliderLbl.Position = UDim2.new(0, 0, 0, jumpToggleY + 30)
+    jumpSliderLbl.Position = UDim2.new(0, 0, 0, jumpToggleY + 31)
     jumpSliderLbl.BackgroundTransparency = 1
     jumpSliderLbl.Text = "Jump Bonus: +" .. CONFIG.Settings.JumpPowerBonus .. " (0 - 150)"
     jumpSliderLbl.TextColor3 = Color3.fromRGB(170, 170, 180)
-    jumpSliderLbl.Font = Enum.Font.SourceSans
+    jumpSliderLbl.Font = Enum.Font.Gotham
     jumpSliderLbl.TextSize = 11
     jumpSliderLbl.TextXAlignment = Enum.TextXAlignment.Left
     jumpSliderLbl.Parent = playerView
 
     local jumpBar = Instance.new("Frame")
     jumpBar.Size = UDim2.new(1, 0, 0, 10)
-    jumpBar.Position = UDim2.new(0, 0, 0, jumpToggleY + 50)
-    jumpBar.BackgroundColor3 = Color3.fromRGB(40, 43, 52)
+    jumpBar.Position = UDim2.new(0, 0, 0, jumpToggleY + 51)
+    jumpBar.BackgroundColor3 = Color3.fromRGB(30, 33, 42)
     jumpBar.Parent = playerView
     CreateCorner(jumpBar, 5)
 
@@ -1209,34 +1291,34 @@ local function BuildGUI()
         lbl.BackgroundTransparency = 1
         lbl.Text = name
         lbl.TextColor3 = Color3.fromRGB(220, 220, 230)
-        lbl.Font = Enum.Font.SourceSans
-        lbl.TextSize = 13
+        lbl.Font = Enum.Font.Gotham
+        lbl.TextSize = 12
         lbl.TextXAlignment = Enum.TextXAlignment.Left
         lbl.Parent = settingsView
 
         local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(0, 60, 0, 24)
-        btn.Position = UDim2.new(1, -60, 0, yPos + 3)
-        btn.BackgroundColor3 = CONFIG.Settings[configKey] and Color3.fromRGB(50, 180, 80) or Color3.fromRGB(180, 50, 50)
+        btn.Size = UDim2.new(0, 60, 0, 26)
+        btn.Position = UDim2.new(1, -60, 0, yPos + 2)
+        btn.BackgroundColor3 = CONFIG.Settings[configKey] and Color3.fromRGB(46, 160, 67) or Color3.fromRGB(200, 50, 50)
         btn.Text = CONFIG.Settings[configKey] and "ON" or "OFF"
         btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-        btn.Font = Enum.Font.SourceSansBold
-        btn.TextSize = 12
+        btn.Font = Enum.Font.GothamBold
+        btn.TextSize = 11
         btn.Parent = settingsView
-        CreateCorner(btn, 4)
+        CreateCorner(btn, 6)
 
         btn.MouseButton1Click:Connect(function()
             CONFIG.Settings[configKey] = not CONFIG.Settings[configKey]
-            btn.BackgroundColor3 = CONFIG.Settings[configKey] and Color3.fromRGB(50, 180, 80) or Color3.fromRGB(180, 50, 50)
+            btn.BackgroundColor3 = CONFIG.Settings[configKey] and Color3.fromRGB(46, 160, 67) or Color3.fromRGB(200, 50, 50)
             btn.Text = CONFIG.Settings[configKey] and "ON" or "OFF"
             ScanForCollectibles()
         end)
     end
 
     CreateToggleSetting("Anti-AFK Bypass", 5, "AntiAfkEnabled")
-    CreateToggleSetting("Mod / High-Rank Detector", 40, "ModDetectorEnabled")
-    CreateToggleSetting("Enable Visual Highlighting", 75, "HighlightsEnabled")
-    CreateToggleSetting("Display Floating Text Labels", 110, "DisplayLabels")
+    CreateToggleSetting("Mod / High-Rank Detector", 42, "ModDetectorEnabled")
+    CreateToggleSetting("Enable Visual Highlighting", 79, "HighlightsEnabled")
+    CreateToggleSetting("Display Floating Text Labels", 116, "DisplayLabels")
 
     local unloadBtn = Instance.new("TextButton")
     unloadBtn.Size = UDim2.new(1, 0, 0, 36)
@@ -1244,8 +1326,8 @@ local function BuildGUI()
     unloadBtn.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
     unloadBtn.Text = "Completely Unload Script"
     unloadBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    unloadBtn.Font = Enum.Font.SourceSansBold
-    unloadBtn.TextSize = 13
+    unloadBtn.Font = Enum.Font.GothamBold
+    unloadBtn.TextSize = 12
     unloadBtn.Parent = settingsView
     CreateCorner(unloadBtn, 6)
 
@@ -1280,8 +1362,8 @@ PopulateFinderList = function()
         emptyText.BackgroundTransparency = 1
         emptyText.Text = "No Crates or Candy Pails found.\nItems must spawn in Workspace."
         emptyText.TextColor3 = Color3.fromRGB(150, 150, 160)
-        emptyText.Font = Enum.Font.SourceSansItalic
-        emptyText.TextSize = 13
+        emptyText.Font = Enum.Font.Gotham
+        emptyText.TextSize = 12
         emptyText.Parent = scrollContainer
         return
     end
@@ -1289,7 +1371,7 @@ PopulateFinderList = function()
     for _, item in ipairs(filtered) do
         local row = Instance.new("Frame")
         row.Size = UDim2.new(1, -6, 0, 36)
-        row.BackgroundColor3 = Color3.fromRGB(30, 32, 38)
+        row.BackgroundColor3 = Color3.fromRGB(26, 28, 36)
         row.Parent = scrollContainer
         CreateCorner(row, 6)
 
@@ -1305,8 +1387,8 @@ PopulateFinderList = function()
         nameLabel.BackgroundTransparency = 1
         nameLabel.Text = item.Name
         nameLabel.TextColor3 = Color3.fromRGB(230, 230, 240)
-        nameLabel.Font = Enum.Font.SourceSansBold
-        nameLabel.TextSize = 13
+        nameLabel.Font = Enum.Font.GothamBold
+        nameLabel.TextSize = 12
         nameLabel.TextXAlignment = Enum.TextXAlignment.Left
         nameLabel.Parent = row
 
@@ -1316,20 +1398,20 @@ PopulateFinderList = function()
         distLabel.BackgroundTransparency = 1
         distLabel.Text = tostring(item.Distance) .. " studs"
         distLabel.TextColor3 = Color3.fromRGB(160, 160, 170)
-        distLabel.Font = Enum.Font.SourceSans
-        distLabel.TextSize = 12
+        distLabel.Font = Enum.Font.Gotham
+        distLabel.TextSize = 11
         distLabel.Parent = row
 
         local trackBtn = Instance.new("TextButton")
         trackBtn.Size = UDim2.new(0.22, -6, 0, 24)
         trackBtn.Position = UDim2.new(0.78, 0, 0.5, -12)
-        trackBtn.BackgroundColor3 = (State.CurrentTrackedTarget == item.Instance) and Color3.fromRGB(50, 180, 80) or Color3.fromRGB(50, 52, 62)
+        trackBtn.BackgroundColor3 = (State.CurrentTrackedTarget == item.Instance) and Color3.fromRGB(46, 160, 67) or Color3.fromRGB(45, 48, 60)
         trackBtn.Text = (State.CurrentTrackedTarget == item.Instance) and "Walking..." or "Track & Go"
         trackBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-        trackBtn.Font = Enum.Font.SourceSansBold
+        trackBtn.Font = Enum.Font.GothamBold
         trackBtn.TextSize = 10
         trackBtn.Parent = row
-        CreateCorner(trackBtn, 4)
+        CreateCorner(trackBtn, 5)
 
         trackBtn.MouseButton1Click:Connect(function()
             if State.CurrentTrackedTarget == item.Instance then
@@ -1369,7 +1451,6 @@ local function Initialize()
         StepAntiAfk(dt)
         ApplyPlayerModifications()
 
-        -- Update Live Stats Tracker UI
         if State.StatsLabelRef then
             local scriptRuntime = math.floor(tick() - State.ScriptStartTime)
             local autoFarmTime = 0
