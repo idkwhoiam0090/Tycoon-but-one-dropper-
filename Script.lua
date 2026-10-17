@@ -1,23 +1,13 @@
---[[
-    ========================================================================
-    TYCOON COLLECTIBLE FINDER - ULTIMATE AUTOMATION SCRIPT V8.1
-    ========================================================================
-    Location: StarterPlayer -> StarterPlayerScripts -> LocalScript
-    Purpose:  - Virtual Input Simulation for Quests, Daily, Spin, Rebirth & Cauldron
-              - Modern UI Redesign with Minimize & Right Shift Toggle
-              - Stable Additive WalkSpeed & JumpPower + Auto-Farm & Waypoints
-    ========================================================================
---]]
-
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local CollectionService = game:GetService("CollectionService")
 local PathfindingService = game:GetService("PathfindingService")
 local VirtualUser = game:GetService("VirtualUser")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local GuiService = game:GetService("GuiService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local StarterGui = game:GetService("StarterGui")
-local VirtualInputManager = game:GetService("VirtualInputManager")
 
 local LocalPlayer = Players.LocalPlayer
 local Camera = workspace.CurrentCamera
@@ -26,11 +16,7 @@ local RemotesFolder = ReplicatedStorage:WaitForChild("Remotes", 5)
 local ActionRemote = RemotesFolder and RemotesFolder:FindFirstChild("Action")
 local NetRemote = RemotesFolder and RemotesFolder:FindFirstChild("Net")
 local TrackRemote = RemotesFolder and RemotesFolder:FindFirstChild("Track")
-local Remotes = RemotesFolder or ReplicatedStorage
 
---------------------------------------------------------------------------------
--- 1. CONFIGURATION TABLE
---------------------------------------------------------------------------------
 local CONFIG = {
     MysteryCrate = {
         CategoryName = "Mystery Crates",
@@ -62,20 +48,18 @@ local CONFIG = {
         AutoClaimQuestsEnabled = false,
         AutoClaimDailyEnabled = false,
         ModDetectorEnabled = true,
-        
+        PlayerESPEnabled = false,
         WalkSpeedEnabled = false,
         WalkSpeedBonus = 16,
         JumpPowerEnabled = false,
         JumpPowerBonus = 50,
         AutoBrewEnabled = false,
         BrewLimit = 999999,
-        BrewsCompleted = 0
+        BrewsCompleted = 0,
+        ToggleKey = Enum.KeyCode.RightShift
     }
 }
 
---------------------------------------------------------------------------------
--- 2. STATE MANAGEMENT & STATS TRACKER
---------------------------------------------------------------------------------
 local State = {
     ActiveTab = "Finder",
     CategoryFilter = "All",
@@ -83,83 +67,64 @@ local State = {
     DetectedCollectibles = {},
     CurrentTrackedTarget = nil,
     AutoWalkEnabled = false,
-
     OriginalWalkSpeed = 16,
     OriginalJumpPower = 50,
     HasCapturedOriginals = false,
-
     CratesClaimed = 0,
     PailsClaimed = 0,
     ScriptStartTime = tick(),
     AutoFarmStartTime = 0,
     PreviousTargetInstance = nil,
     PreviousTargetCategory = nil,
-
     Waypoints = {},
     CurrentWaypointIndex = 1,
     LastPathCalcTick = 0,
     LastPosition = Vector3.zero,
     StuckTimer = 0,
     IsComputingPath = false,
-
     Highlights = {},
     BillboardGuis = {},
+    PlayerESPs = {},
     Connections = {},
     GuiInstance = nil,
     Views = {},
     StatsLabelRef = nil,
     IsMinimized = false,
-    
-    LastAntiAfkTick = 0
+    IsListeningForKey = false,
+    LastAntiAfkTick = 0,
+    SpinLogs = {},
+    BrewLogs = {},
+    SpinLogLabels = {},
+    BrewLogLabels = {},
+    SpinWin = nil,
+    BrewWin = nil
 }
 
---------------------------------------------------------------------------------
--- 3. HELPER FUNCTIONS
---------------------------------------------------------------------------------
-local function GetCharacter(): Model?
-    return LocalPlayer.Character
-end
+local function GetCharacter() return LocalPlayer.Character end
+local function GetHumanoid() local c = GetCharacter() return c and c:FindFirstChildWhichIsA("Humanoid") end
+local function GetRootPart() local c = GetCharacter() return c and c:FindFirstChild("HumanoidRootPart") end
+local function GetCharacterPosition() local r = GetRootPart() return r and r.Position end
 
-local function GetHumanoid(): Humanoid?
-    local char = GetCharacter()
-    return char and char:FindFirstChildWhichIsA("Humanoid")
-end
-
-local function GetRootPart(): BasePart?
-    local char = GetCharacter()
-    return char and char:FindFirstChild("HumanoidRootPart")
-end
-
-local function GetCharacterPosition(): Vector3?
-    local root = GetRootPart()
-    return root and root.Position
-end
-
-local function CalculateDistance(targetPos: Vector3): number
-    local charPos = GetCharacterPosition()
-    if charPos then
-        return math.floor((targetPos - charPos).Magnitude)
-    end
+local function CalculateDistance(pos)
+    local cp = GetCharacterPosition()
+    if cp then return math.floor((pos - cp).Magnitude) end
     return 999999
 end
 
-local function GetPrimaryPart(obj: Instance): BasePart?
-    if obj:IsA("BasePart") then
-        return obj
-    elseif obj:IsA("Model") then
-        return obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart", true)
-    end
+local function GetPrimaryPart(obj)
+    if obj:IsA("BasePart") then return obj
+    elseif obj:IsA("Model") then return obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart", true) end
     return nil
 end
 
-local function CreateCorner(parent: Instance, radius: number)
+local function CreateCorner(parent, radius)
     local corner = Instance.new("UICorner")
     corner.CornerRadius = UDim.new(0, radius)
     corner.Parent = parent
     return corner
 end
 
-local function CreateStroke(parent: Instance, color: Color3, thickness: number)
+local function CreateStroke(parent, color, thickness)
     local stroke = Instance.new("UIStroke")
     stroke.Color = color
     stroke.Thickness = thickness
@@ -167,145 +132,282 @@ local function CreateStroke(parent: Instance, color: Color3, thickness: number)
     return stroke
 end
 
-local function FormatTime(totalSeconds: number): string
-    local minutes = math.floor(totalSeconds / 60)
-    local seconds = totalSeconds % 60
-    return string.format("%02d:%02d", minutes, seconds)
+local function FormatTime(totalSeconds)
+    local m = math.floor(totalSeconds / 60)
+    local s = totalSeconds % 60
+    return string.format("%02d:%02d", m, s)
 end
 
---------------------------------------------------------------------------------
--- 4. VIRTUAL INPUT & REMOTE AUTOMATION LOOP
---------------------------------------------------------------------------------
-local function SendBridgeNetworkAction(actionNames)
-    local targetRemotes = {ActionRemote, NetRemote, TrackRemote}
-    for _, remote in ipairs(targetRemotes) do
-        if remote then
-            for _, action in ipairs(actionNames) do
-                pcall(function()
-                    if remote:IsA("RemoteEvent") then
-                        remote:FireServer(action)
-                        remote:FireServer({Action = action})
-                    elseif remote:IsA("RemoteFunction") then
-                        remote:InvokeServer(action)
-                        remote:InvokeServer({Action = action})
-                    end
-                end)
-            end
-        end
+local function AddLogEntry(logType, message)
+    local targetList = (logType == "Spin") and State.SpinLogs or State.BrewLogs
+    local targetLabels = (logType == "Spin") and State.SpinLogLabels or State.BrewLogLabels
+    local formatted = string.format("[%s] %s", os.date("%H:%M:%S"), tostring(message))
+
+    table.insert(targetList, 1, formatted)
+    if #targetList > 10 then table.remove(targetList, 11) end
+
+    for i = 1, 10 do
+        if targetLabels[i] then targetLabels[i].Text = targetList[i] or "" end
     end
 end
 
-local function SimulateClickOnButton(btn)
-    if not btn or not (btn:IsA("TextButton") or btn:IsA("ImageButton")) then return end
-    pcall(function()
-        local absPos = btn.AbsolutePosition
-        local absSize = btn.AbsoluteSize
-        local centerX = absPos.X + (absSize.X / 2)
-        local centerY = absPos.Y + (absSize.Y / 2)
-
-        -- Use VirtualInputManager to send genuine click events
-        if VirtualInputManager then
-            VirtualInputManager:SendMouseButtonEvent(centerX, centerY, 0, true, game, 1)
-            task.wait(0.05)
-            VirtualInputManager:SendMouseButtonEvent(centerX, centerY, 0, false, game, 1)
-        else
-            VirtualUser:Button1Down(Vector2.new(centerX, centerY))
-            task.wait(0.05)
-            VirtualUser:Button1Up(Vector2.new(centerX, centerY))
-        end
+local function SafeInvoke(...)
+    if not ActionRemote then return nil end
+    local args = {...}
+    local success, res = pcall(function()
+        return ActionRemote:InvokeServer(unpack(args))
     end)
+    if success then return res end
+    return nil
 end
 
-local function ClickButtonInstanceByPath(parentPath, buttonName)
-    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
-    if not playerGui then return end
-    
-    local targetFrame = playerGui
-    for _, pathPart in ipairs(parentPath) do
-        targetFrame = targetFrame:FindFirstChild(pathPart)
-        if not targetFrame then return end
-    end
-
-    local btn = targetFrame:FindFirstChild(buttonName)
-    if btn then SimulateClickOnButton(btn) end
+local function SafeFireEvent(...)
+    local args = {...}
+    if NetRemote then pcall(function() NetRemote:FireServer(unpack(args)) end) end
+    if TrackRemote then pcall(function() TrackRemote:FireServer(unpack(args)) end) end
 end
 
-local function ScanAndClickKeywords(keywords)
-    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
-    if not playerGui then return end
-
-    for _, ui in ipairs(playerGui:GetDescendants()) do
-        if ui:IsA("TextButton") or ui:IsA("ImageButton") then
-            if ui.Visible and ui.AbsoluteSize.X > 0 and ui.AbsoluteSize.Y > 0 then
-                local btnText = ui:IsA("TextButton") and ui.Text:lower() or ""
-                local btnName = ui.Name:lower()
-
-                for _, kw in ipairs(keywords) do
-                    if string.find(btnText, kw) or string.find(btnName, kw) then
-                        SimulateClickOnButton(ui)
-                        break
-                    end
-                end
+local function ExtractRewardText(res, fallback)
+    if type(res) == "string" then return res end
+    if type(res) == "table" then
+        if res.Reward then return tostring(res.Reward) end
+        if res.Prize then return tostring(res.Prize) end
+        if res.Item then return tostring(res.Item) end
+        if res.Name then return tostring(res.Name) end
+        if res.msg and res.msg ~= "" then return tostring(res.msg) end
+        for k, v in pairs(res) do
+            if type(v) == "string" and k ~= "ok" and k ~= "msg" and #v > 2 then
+                return v
+            elseif type(v) == "table" then
+                if v.Name then return tostring(v.Name) end
+                if v.Reward then return tostring(v.Reward) end
             end
         end
     end
+    return fallback
 end
 
--- 1-Second Automation Loop
 task.spawn(function()
     while true do
-        task.wait(1.5)
-        pcall(function()
-            if CONFIG.Settings.AutoRebirthEnabled then
-                SendBridgeNetworkAction({"Rebirth", "DoRebirth", "BuyRebirth"})
-                ClickButtonInstanceByPath({"HUD", "Main", "Left"}, "Rebirth")
-                ScanAndClickKeywords({"rebirth", "yes", "confirm"})
-            end
+        task.wait(3.0)
+        if not State.GuiInstance then break end
+        if CONFIG.Settings.AutoRebirthEnabled then
+            pcall(function()
+                SafeInvoke("Rebirth")
+                SafeInvoke("Rebirth", "Buy")
+                SafeFireEvent("Rebirth")
+            end)
+        end
+    end
+end)
 
-            if CONFIG.Settings.AutoSpinWheelEnabled then
-                SendBridgeNetworkAction({"Spin", "FreeSpin", "SpinWheel", "DailySpin"})
-                ClickButtonInstanceByPath({"HUD", "Main", "Right"}, "Spin")
-                ScanAndClickKeywords({"spin", "free spin"})
-            end
+task.spawn(function()
+    while true do
+        task.wait(4.5)
+        if not State.GuiInstance then break end
+        if CONFIG.Settings.AutoSpinWheelEnabled then
+            pcall(function()
+                local res = SafeInvoke("Spin", "Roll") 
+                    or SafeInvoke("Wheel", "Spin") 
+                    or SafeInvoke("Spin")
 
-            if CONFIG.Settings.AutoClaimQuestsEnabled then
-                SendBridgeNetworkAction({"ClaimQuest", "CompleteQuest", "ClaimAll"})
-                ClickButtonInstanceByPath({"HUD", "Main", "Left"}, "Quests")
-                ScanAndClickKeywords({"claim", "complete", "collect", "reward"})
-            end
+                local rewardStr = nil
+                if res and type(res) == "table" and (res.ok == true or res.Reward or res.Prize) then
+                    rewardStr = ExtractRewardText(res, "Wheel Spin Claimed")
+                end
 
-            if CONFIG.Settings.AutoClaimDailyEnabled then
-                SendBridgeNetworkAction({"ClaimDaily", "DailyReward", "DailyClaim"})
-                ClickButtonInstanceByPath({"HUD", "Main", "Left"}, "Daily")
-                ScanAndClickKeywords({"claim", "collect", "take", "day"})
-            end
+                local hudMain = LocalPlayer.PlayerGui:FindFirstChild("HUD") and LocalPlayer.PlayerGui.HUD:FindFirstChild("Main")
+                if hudMain then
+                    local spinBtn = hudMain.Right:FindFirstChild("Spin")
+                    if spinBtn then
+                        local absPos = spinBtn.AbsolutePosition
+                        local absSize = spinBtn.AbsoluteSize
+                        local inset, _ = GuiService:GetGuiInset()
+                        local cx = absPos.X + absSize.X / 2
+                        local cy = absPos.Y + absSize.Y / 2 + inset.Y
 
-            if CONFIG.Settings.AutoBrewEnabled and CONFIG.Settings.BrewsCompleted < CONFIG.Settings.BrewLimit then
-                for _, obj in ipairs(workspace:GetDescendants()) do
-                    if obj.Name:lower():find("cauldron") then
-                        local primaryPart = GetPrimaryPart(obj)
-                        if primaryPart and CalculateDistance(primaryPart.Position) <= 25 then
-                            for _, desc in ipairs(obj:GetDescendants()) do
-                                if desc:IsA("ProximityPrompt") then
-                                    pcall(function() fireproximityprompt(desc) end)
-                                elseif desc:IsA("ClickDetector") then
-                                    pcall(function() fireclickdetector(desc) end)
+                        VirtualInputManager:SendMouseButtonEvent(cx, cy, 0, true, game, 1)
+                        task.wait(0.04)
+                        VirtualInputManager:SendMouseButtonEvent(cx, cy, 0, false, game, 1)
+
+                        task.wait(0.25)
+                        for _, child in ipairs(hudMain:GetDescendants()) do
+                            if (child:IsA("GuiButton") or child:IsA("TextLabel")) and child.Visible then
+                                local t = child:IsA("TextLabel") and child.Text:lower() or (child:IsA("TextButton") and child.Text:lower() or "")
+                                if t:find("free spin") or t == "spin" or t:find("roll") then
+                                    local p = child.AbsolutePosition
+                                    local s = child.AbsoluteSize
+                                    VirtualInputManager:SendMouseButtonEvent(p.X + s.X/2, p.Y + s.Y/2 + inset.Y, 0, true, game, 1)
+                                    task.wait(0.04)
+                                    VirtualInputManager:SendMouseButtonEvent(p.X + s.X/2, p.Y + s.Y/2 + inset.Y, 0, false, game, 1)
+                                    if not rewardStr then rewardStr = "Used 1x Wheel Spin" end
+                                    break
                                 end
                             end
                         end
                     end
                 end
-                SendBridgeNetworkAction({"BrewCauldron", "Brew", "StartBrew", "CraftCauldron"})
-                ScanAndClickKeywords({"brew", "cook", "craft", "start"})
-                CONFIG.Settings.BrewsCompleted = CONFIG.Settings.BrewsCompleted + 1
-            end
-        end)
+
+                if rewardStr then
+                    AddLogEntry("Spin", rewardStr)
+                end
+            end)
+        end
     end
 end)
 
---------------------------------------------------------------------------------
--- 5. ROBUST PLAYER STATS MODIFICATIONS (SPEED & JUMP)
---------------------------------------------------------------------------------
+task.spawn(function()
+    while true do
+        task.wait(5.0)
+        if not State.GuiInstance then break end
+        if CONFIG.Settings.AutoClaimDailyEnabled then
+            pcall(function()
+                local res = SafeInvoke("ClaimDaily") or SafeInvoke("Daily", "Claim")
+                if res and type(res) == "table" and res.ok then
+                    AddLogEntry("Spin", "Daily: " .. ExtractRewardText(res, "Daily Claimed!"))
+                end
+            end)
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(4.0)
+        if not State.GuiInstance then break end
+        if CONFIG.Settings.AutoClaimQuestsEnabled then
+            pcall(function()
+                local questData = SafeInvoke("Quests", "Brew")
+                if questData and type(questData) == "table" and questData.ok then
+                    local function ClaimCategory(cat)
+                        if type(cat) ~= "table" then return end
+                        for qId, _ in pairs(cat) do
+                            SafeInvoke("Quests", "Claim", qId)
+                            task.wait(0.35)
+                        end
+                    end
+                    ClaimCategory(questData.Daily)
+                    ClaimCategory(questData.Weekly)
+                    ClaimCategory(questData.Ach)
+                else
+                    for _, id in ipairs({"dGold", "dPlay", "dMystery", "wGold", "wPlay", "wMystery", 1, 2, 3, 4, 5}) do
+                        SafeInvoke("Quests", "Claim", id)
+                        task.wait(0.35)
+                    end
+                end
+            end)
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(2.5)
+        if not State.GuiInstance then break end
+        if CONFIG.Settings.AutoBrewEnabled and CONFIG.Settings.BrewsCompleted < CONFIG.Settings.BrewLimit then
+            pcall(function()
+                local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+                local hudMain = playerGui and playerGui:FindFirstChild("HUD") and playerGui.HUD:FindFirstChild("Main")
+                local brewBtn = hudMain and hudMain:FindFirstChild("Halloween") 
+                    and hudMain.Halloween:FindFirstChild("Body")
+                    and hudMain.Halloween.Body:FindFirstChild("Cauldron")
+                    and hudMain.Halloween.Body.Cauldron:FindFirstChild("Brew")
+
+                if brewBtn and brewBtn.Visible then
+                    for _, child in ipairs(brewBtn:GetDescendants()) do
+                        if child:IsA("GuiObject") and child ~= brewBtn then
+                            child.Active = false
+                        end
+                    end
+
+                    local inset, _ = GuiService:GetGuiInset()
+                    local absPos = brewBtn.AbsolutePosition
+                    local absSize = brewBtn.AbsoluteSize
+                    local clickX = absPos.X + (absSize.X / 2)
+                    local clickY = absPos.Y + (absSize.Y / 2) + inset.Y
+
+                    VirtualInputManager:SendMouseButtonEvent(clickX, clickY, 0, true, game, 1)
+                    task.wait(0.04)
+                    VirtualInputManager:SendMouseButtonEvent(clickX, clickY, 0, false, game, 1)
+
+                    task.wait(0.35)
+
+                    local prizeName = nil
+                    local cauldronContainer = hudMain.Halloween.Body.Cauldron
+                    for _, d in ipairs(cauldronContainer:GetDescendants()) do
+                        if d:IsA("TextLabel") and d.Visible and #d.Text > 1 then
+                            local txt = d.Text
+                            if txt ~= "BREW" and txt ~= "75" and txt ~= "THE CAULDRON" and not txt:find("pity") then
+                                prizeName = txt
+                                break
+                            end
+                        end
+                    end
+
+                    if not prizeName then
+                        prizeName = "Cauldron Brewed (-75 Candy)"
+                    end
+
+                    CONFIG.Settings.BrewsCompleted = CONFIG.Settings.BrewsCompleted + 1
+                    AddLogEntry("Brew", string.format("%s (x%d)", prizeName, CONFIG.Settings.BrewsCompleted))
+                end
+            end)
+        end
+    end
+end)
+
+local function UpdatePlayerESP()
+    if not CONFIG.Settings.PlayerESPEnabled then
+        for plr, esp in pairs(State.PlayerESPs) do
+            if esp.Highlight then esp.Highlight:Destroy() end
+            if esp.Billboard then esp.Billboard:Destroy() end
+        end
+        table.clear(State.PlayerESPs)
+        return
+    end
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+            local char = player.Character
+            if not State.PlayerESPs[player] or State.PlayerESPs[player].Character ~= char then
+                if State.PlayerESPs[player] then
+                    if State.PlayerESPs[player].Highlight then State.PlayerESPs[player].Highlight:Destroy() end
+                    if State.PlayerESPs[player].Billboard then State.PlayerESPs[player].Billboard:Destroy() end
+                end
+
+                local hl = Instance.new("Highlight")
+                hl.FillColor = Color3.fromRGB(255, 50, 50)
+                hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+                hl.FillTransparency = 0.6
+                hl.OutlineTransparency = 0.2
+                hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+                hl.Parent = char
+
+                local bb = Instance.new("BillboardGui")
+                bb.Size = UDim2.new(0, 200, 0, 30)
+                bb.StudsOffset = Vector3.new(0, 3.5, 0)
+                bb.AlwaysOnTop = true
+
+                local txt = Instance.new("TextLabel")
+                txt.Size = UDim2.new(1, 0, 1, 0)
+                txt.BackgroundTransparency = 1
+                txt.Text = player.Name
+                txt.TextColor3 = Color3.fromRGB(255, 255, 255)
+                txt.TextStrokeTransparency = 0.2
+                txt.Font = Enum.Font.GothamBold
+                txt.TextSize = 12
+                txt.Parent = bb
+                bb.Parent = char
+
+                State.PlayerESPs[player] = {Highlight = hl, Billboard = bb, Character = char, Label = txt}
+            else
+                local dist = CalculateDistance(char.HumanoidRootPart.Position)
+                State.PlayerESPs[player].Label.Text = player.Name .. " [" .. tostring(dist) .. "s]"
+            end
+        end
+    end
+end
+
 local function ApplyPlayerModifications()
     local hum = GetHumanoid()
     if not hum then return end
@@ -335,11 +437,8 @@ local function ApplyPlayerModifications()
     end
 end
 
---------------------------------------------------------------------------------
--- 6. ANTI-AFK & MOD DETECTOR
---------------------------------------------------------------------------------
 local function SetupAntiAfk()
-    local idledConn = LocalPlayer.Idled:Connect(function()
+    local conn = LocalPlayer.Idled:Connect(function()
         if CONFIG.Settings.AntiAfkEnabled then
             pcall(function()
                 VirtualUser:CaptureController()
@@ -347,7 +446,7 @@ local function SetupAntiAfk()
             end)
         end
     end)
-    table.insert(State.Connections, idledConn)
+    table.insert(State.Connections, conn)
 end
 
 local function StepAntiAfk(dt)
@@ -369,23 +468,17 @@ local function CheckPlayerForMod(player)
     local nameLower = player.Name:lower()
     local dispLower = player.DisplayName:lower()
     local keywords = {"mod", "admin", "owner", "developer", "dev", "staff", "helper", "trial", "creator"}
-    local isHighRank = false
-
     for _, kw in ipairs(keywords) do
         if string.find(nameLower, kw) or string.find(dispLower, kw) then
-            isHighRank = true
+            pcall(function()
+                StarterGui:SetCore("SendNotification", {
+                    Title = "SECURITY ALERT!",
+                    Text = "Mod joined: " .. player.Name,
+                    Duration = 10
+                })
+            end)
             break
         end
-    end
-
-    if isHighRank then
-        pcall(function()
-            StarterGui:SetCore("SendNotification", {
-                Title = "SECURITY ALERT!",
-                Text = "Mod/High-Rank joined: " .. player.Name,
-                Duration = 10
-            })
-        end)
     end
 end
 
@@ -397,29 +490,21 @@ local function SetupModDetector()
     table.insert(State.Connections, conn)
 end
 
---------------------------------------------------------------------------------
--- 7. PATHFINDING & AUTO-WALK
---------------------------------------------------------------------------------
 local function StopAutoWalk()
     local hum = GetHumanoid()
-    if hum then
-        hum:MoveTo(GetCharacterPosition() or Vector3.zero)
-    end
+    if hum then hum:MoveTo(GetCharacterPosition() or Vector3.zero) end
     State.Waypoints = {}
     State.CurrentWaypointIndex = 1
     State.StuckTimer = 0
 end
 
-local function ComputePathToAsync(targetPos: Vector3)
+local function ComputePathToAsync(targetPos)
     if State.IsComputingPath then return end
     State.IsComputingPath = true
 
     task.defer(function()
         local charPos = GetCharacterPosition()
-        if not charPos then 
-            State.IsComputingPath = false
-            return 
-        end
+        if not charPos then State.IsComputingPath = false return end
 
         local path = PathfindingService:CreatePath({
             AgentRadius = 2.5,
@@ -428,10 +513,7 @@ local function ComputePathToAsync(targetPos: Vector3)
             WaypointSpacing = 4.0
         })
 
-        local success, _ = pcall(function()
-            path:ComputeAsync(charPos, targetPos)
-        end)
-
+        local success = pcall(function() path:ComputeAsync(charPos, targetPos) end)
         if success and path.Status == Enum.PathStatus.Success then
             State.Waypoints = path:GetWaypoints()
             State.CurrentWaypointIndex = 2
@@ -439,7 +521,6 @@ local function ComputePathToAsync(targetPos: Vector3)
             local hum = GetHumanoid()
             if hum then hum:MoveTo(targetPos) end
         end
-
         State.IsComputingPath = false
     end)
 end
@@ -475,11 +556,9 @@ local function StepAutoWalk()
     local targetPart = GetPrimaryPart(State.CurrentTrackedTarget)
     local hum = GetHumanoid()
     local charPos = GetCharacterPosition()
-
     if not targetPart or not hum or not charPos then return end
 
     local dist = CalculateDistance(targetPart.Position)
-
     if dist <= CONFIG.Settings.StopDistance then
         if not CONFIG.Settings.AutoFarmEnabled then
             State.AutoWalkEnabled = false
@@ -527,18 +606,9 @@ local function StepAutoWalk()
     end
 end
 
---------------------------------------------------------------------------------
--- 8. HIGHLIGHTS & LABELS
---------------------------------------------------------------------------------
-local function RemoveHighlightFor(inst: Instance)
-    if State.Highlights[inst] then
-        State.Highlights[inst]:Destroy()
-        State.Highlights[inst] = nil
-    end
-    if State.BillboardGuis[inst] then
-        State.BillboardGuis[inst]:Destroy()
-        State.BillboardGuis[inst] = nil
-    end
+local function RemoveHighlightFor(inst)
+    if State.Highlights[inst] then State.Highlights[inst]:Destroy() State.Highlights[inst] = nil end
+    if State.BillboardGuis[inst] then State.BillboardGuis[inst]:Destroy() State.BillboardGuis[inst] = nil end
 end
 
 local function ClearAllHighlights()
@@ -598,10 +668,7 @@ local function ApplyHighlight(itemData)
     end
 end
 
---------------------------------------------------------------------------------
--- 9. SCANNING & COLLECTION
---------------------------------------------------------------------------------
-local function IsCollectibleMatch(inst: Instance, categoryConfig): boolean
+local function IsCollectibleMatch(inst, categoryConfig)
     for _, tag in ipairs(categoryConfig.Tags) do
         if CollectionService:HasTag(inst, tag) then return true end
     end
@@ -629,7 +696,7 @@ local function ScanForCollectibles()
     local found = {}
     local seen = {}
 
-    local function EvaluateInstance(inst: Instance)
+    local function EvaluateInstance(inst)
         if seen[inst] then return end
         local part = GetPrimaryPart(inst)
         if not part then return end
@@ -662,9 +729,7 @@ local function ScanForCollectibles()
     end
 
     for _, obj in ipairs(workspace:GetChildren()) do
-        if obj:IsA("Model") or obj:IsA("BasePart") then
-            EvaluateInstance(obj)
-        end
+        if obj:IsA("Model") or obj:IsA("BasePart") then EvaluateInstance(obj) end
     end
 
     table.sort(found, function(a, b) return a.Distance < b.Distance end)
@@ -698,9 +763,6 @@ local function ScanForCollectibles()
     end
 end
 
---------------------------------------------------------------------------------
--- 10. WAYPOINT OVERLAY
---------------------------------------------------------------------------------
 local WaypointGui = nil
 local ArrowFrame = nil
 local DistanceText = nil
@@ -773,9 +835,6 @@ local function UpdateWaypointTracking()
     end
 end
 
---------------------------------------------------------------------------------
--- 11. UNLOAD & CLEANUP
---------------------------------------------------------------------------------
 local function UnloadScript()
     for _, conn in ipairs(State.Connections) do
         if conn and conn.Connected then conn:Disconnect() end
@@ -794,6 +853,9 @@ local function UnloadScript()
     CONFIG.Settings.AutoBrewEnabled = false
     CONFIG.Settings.WalkSpeedEnabled = false
     CONFIG.Settings.JumpPowerEnabled = false
+    CONFIG.Settings.PlayerESPEnabled = false
+    
+    UpdatePlayerESP()
 
     local hum = GetHumanoid()
     if hum and State.HasCapturedOriginals then
@@ -809,9 +871,6 @@ local function UnloadScript()
     if State.GuiInstance then State.GuiInstance:Destroy() State.GuiInstance = nil end
 end
 
---------------------------------------------------------------------------------
--- 12. MODERN GUI CONSTRUCTION & KEYBINDS
---------------------------------------------------------------------------------
 local PopulateFinderList
 
 local function SwitchTab(targetTab)
@@ -822,6 +881,103 @@ local function SwitchTab(targetTab)
     if targetTab == "Finder" then
         PopulateFinderList()
     end
+end
+
+local function CreateStaticLogWindow(name, titleStr, pos, logKey)
+    local win = Instance.new("Frame")
+    win.Name = name
+    win.Size = UDim2.new(0, 240, 0, 205)
+    win.Position = pos
+    win.BackgroundColor3 = Color3.fromRGB(18, 19, 24)
+    win.Visible = false
+    win.Parent = State.GuiInstance
+    CreateCorner(win, 8)
+    CreateStroke(win, Color3.fromRGB(50, 53, 65), 1)
+
+    local titleBar = Instance.new("Frame")
+    titleBar.Size = UDim2.new(1, 0, 0, 28)
+    titleBar.BackgroundColor3 = Color3.fromRGB(26, 28, 35)
+    titleBar.Parent = win
+    CreateCorner(titleBar, 8)
+
+    local dragging, dragStart, startPos
+    titleBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = win.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            win.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end)
+
+    local titleText = Instance.new("TextLabel")
+    titleText.Size = UDim2.new(0.7, 0, 1, 0)
+    titleText.Position = UDim2.new(0, 10, 0, 0)
+    titleText.BackgroundTransparency = 1
+    titleText.Text = titleStr
+    titleText.TextColor3 = Color3.fromRGB(245, 245, 250)
+    titleText.Font = Enum.Font.GothamBold
+    titleText.TextSize = 12
+    titleText.TextXAlignment = Enum.TextXAlignment.Left
+    titleText.Parent = titleBar
+
+    local minBtn = Instance.new("TextButton")
+    minBtn.Size = UDim2.new(0, 20, 0, 20)
+    minBtn.Position = UDim2.new(1, -24, 0.5, -10)
+    minBtn.BackgroundColor3 = Color3.fromRGB(45, 48, 60)
+    minBtn.Text = "-"
+    minBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    minBtn.Font = Enum.Font.GothamBold
+    minBtn.TextSize = 12
+    minBtn.Parent = titleBar
+    CreateCorner(minBtn, 4)
+
+    local contentHolder = Instance.new("Frame")
+    contentHolder.Size = UDim2.new(1, -10, 1, -34)
+    contentHolder.Position = UDim2.new(0, 5, 0, 30)
+    contentHolder.BackgroundTransparency = 1
+    contentHolder.Parent = win
+
+    local labelTable = (logKey == "Spin") and State.SpinLogLabels or State.BrewLogLabels
+
+    for i = 1, 10 do
+        local row = Instance.new("TextLabel")
+        row.Size = UDim2.new(1, 0, 0, 16)
+        row.Position = UDim2.new(0, 0, 0, (i - 1) * 17)
+        row.BackgroundTransparency = 1
+        row.Text = ""
+        row.TextColor3 = Color3.fromRGB(200, 200, 210)
+        row.Font = Enum.Font.Gotham
+        row.TextSize = 10
+        row.TextXAlignment = Enum.TextXAlignment.Left
+        row.TextTruncate = Enum.TextTruncate.AtEnd
+        row.Parent = contentHolder
+        labelTable[i] = row
+    end
+
+    local isMin = false
+    minBtn.MouseButton1Click:Connect(function()
+        isMin = not isMin
+        if isMin then
+            win.Size = UDim2.new(0, 240, 0, 28)
+            contentHolder.Visible = false
+            minBtn.Text = "+"
+        else
+            win.Size = UDim2.new(0, 240, 0, 205)
+            contentHolder.Visible = true
+            minBtn.Text = "-"
+        end
+    end)
+
+    return win
 end
 
 local function BuildGUI()
@@ -845,7 +1001,9 @@ local function BuildGUI()
     CreateCorner(main, 12)
     CreateStroke(main, Color3.fromRGB(50, 53, 65), 1.5)
 
-    -- Title Bar
+    State.SpinWin = CreateStaticLogWindow("SpinLogsWin", "Spin Rewards Log", UDim2.new(0, 15, 0, 45), "Spin")
+    State.BrewWin = CreateStaticLogWindow("BrewLogsWin", "Brew Rewards Log", UDim2.new(0, 15, 0, 260), "Brew")
+
     local titleBar = Instance.new("Frame")
     titleBar.Size = UDim2.new(1, 0, 0, 38)
     titleBar.BackgroundColor3 = Color3.fromRGB(26, 28, 35)
@@ -881,12 +1039,11 @@ local function BuildGUI()
     titleText.TextXAlignment = Enum.TextXAlignment.Left
     titleText.Parent = titleBar
 
-    -- Minimize & Close Buttons
     local closeBtn = Instance.new("TextButton")
     closeBtn.Size = UDim2.new(0, 28, 0, 28)
     closeBtn.Position = UDim2.new(1, -32, 0.5, -14)
     closeBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
-    closeBtn.Text = "✕"
+    closeBtn.Text = "X"
     closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
     closeBtn.Font = Enum.Font.GothamBold
     closeBtn.TextSize = 12
@@ -894,14 +1051,14 @@ local function BuildGUI()
     CreateCorner(closeBtn, 6)
 
     closeBtn.MouseButton1Click:Connect(function()
-        UnloadScript()
+        main.Visible = false
     end)
 
     local minBtn = Instance.new("TextButton")
     minBtn.Size = UDim2.new(0, 28, 0, 28)
     minBtn.Position = UDim2.new(1, -66, 0.5, -14)
     minBtn.BackgroundColor3 = Color3.fromRGB(45, 48, 60)
-    minBtn.Text = "–"
+    minBtn.Text = "-"
     minBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
     minBtn.Font = Enum.Font.GothamBold
     minBtn.TextSize = 14
@@ -924,18 +1081,18 @@ local function BuildGUI()
         else
             main.Size = UDim2.new(0, 460, 0, 410)
             contentHolder.Visible = true
-            minBtn.Text = "–"
+            minBtn.Text = "-"
         end
     end)
 
-    -- Right Shift Keybind Toggle
-    UserInputService.InputBegan:Connect(function(input, gameProcessed)
-        if not gameProcessed and input.KeyCode == Enum.KeyCode.RightShift then
+    local toggleConn = UserInputService.InputBegan:Connect(function(input, gameProcessed)
+        if State.IsListeningForKey then return end
+        if not gameProcessed and input.KeyCode == CONFIG.Settings.ToggleKey then
             main.Visible = not main.Visible
         end
     end)
+    table.insert(State.Connections, toggleConn)
 
-    -- Navigation Bar Buttons (5 Tabs)
     local navBar = Instance.new("Frame")
     navBar.Size = UDim2.new(1, -20, 0, 32)
     navBar.Position = UDim2.new(0, 10, 0, 10)
@@ -977,7 +1134,6 @@ local function BuildGUI()
     CreateTabButton("Player", "Player", 0.19, UDim2.new(0.60, 0, 0, 0))
     CreateTabButton("Settings", "Config", 0.22, UDim2.new(0.80, 0, 0, 0))
 
-    -- LIVE STATS TRACKER PANEL
     local statsPanel = Instance.new("Frame")
     statsPanel.Size = UDim2.new(1, -20, 0, 36)
     statsPanel.Position = UDim2.new(0, 10, 1, -44)
@@ -998,7 +1154,6 @@ local function BuildGUI()
     statsLabel.Parent = statsPanel
     State.StatsLabelRef = statsLabel
 
-    -- VIEW 1: FINDER PANEL
     local finderView = Instance.new("Frame")
     finderView.Name = "FinderView"
     finderView.Size = UDim2.new(1, 0, 1, 0)
@@ -1025,7 +1180,6 @@ local function BuildGUI()
         CONFIG.Settings.AutoFarmEnabled = not CONFIG.Settings.AutoFarmEnabled
         autoFarmToggle.BackgroundColor3 = CONFIG.Settings.AutoFarmEnabled and Color3.fromRGB(46, 160, 67) or Color3.fromRGB(200, 50, 50)
         autoFarmToggle.Text = "AUTO-FARM: " .. (CONFIG.Settings.AutoFarmEnabled and "ON" or "OFF")
-        
         if CONFIG.Settings.AutoFarmEnabled then
             State.AutoFarmStartTime = tick()
         else
@@ -1089,7 +1243,6 @@ local function BuildGUI()
         scrollContainer.CanvasSize = UDim2.new(0, 0, 0, listLayout.AbsoluteContentSize.Y + 10)
     end)
 
-    -- VIEW 2: WAYPOINTS PANEL
     local waypointsView = Instance.new("Frame")
     waypointsView.Name = "WaypointsView"
     waypointsView.Size = UDim2.new(1, 0, 1, 0)
@@ -1106,7 +1259,7 @@ local function BuildGUI()
     wpInfoLabel.Font = Enum.Font.GothamBold
     wpInfoLabel.TextSize = 13
     wpInfoLabel.TextColor3 = Color3.fromRGB(220, 220, 230)
-    wpInfoLabel.Text = "No target selected.\nClick 'Track & Go' in Finder or enable Auto-Farm."
+    wpInfoLabel.Text = "No target selected.\nClick Track & Go in Finder or enable Auto-Farm."
     wpInfoLabel.Parent = waypointsView
 
     local clearBtn = Instance.new("TextButton")
@@ -1127,16 +1280,15 @@ local function BuildGUI()
         autoFarmToggle.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
         autoFarmToggle.Text = "AUTO-FARM: OFF"
         StopAutoWalk()
-        wpInfoLabel.Text = "Target cleared.\nClick 'Track & Go' in Finder or enable Auto-Farm."
+        wpInfoLabel.Text = "Target cleared.\nClick Track & Go in Finder or enable Auto-Farm."
     end)
 
-    -- VIEW 3: GRINDING PANEL
     local grindingView = Instance.new("ScrollingFrame")
     grindingView.Name = "GrindingView"
     grindingView.Size = UDim2.new(1, 0, 1, 0)
     grindingView.BackgroundTransparency = 1
     grindingView.Visible = false
-    grindingView.CanvasSize = UDim2.new(0, 0, 0, 160)
+    grindingView.CanvasSize = UDim2.new(0, 0, 0, 210)
     grindingView.ScrollBarThickness = 4
     grindingView.Parent = contentFrame
     State.Views["Grinding"] = grindingView
@@ -1173,26 +1325,55 @@ local function BuildGUI()
 
     CreateGrindingToggle(grindingView, "Auto Rebirth", 5, "AutoRebirthEnabled")
     CreateGrindingToggle(grindingView, "Auto Spin Wheel", 38, "AutoSpinWheelEnabled")
+
+    local spinLogsBtn = Instance.new("TextButton")
+    spinLogsBtn.Size = UDim2.new(0, 80, 0, 22)
+    spinLogsBtn.Position = UDim2.new(1, -145, 0, 40)
+    spinLogsBtn.BackgroundColor3 = Color3.fromRGB(31, 111, 235)
+    spinLogsBtn.Text = "Show Logs"
+    spinLogsBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    spinLogsBtn.Font = Enum.Font.GothamBold
+    spinLogsBtn.TextSize = 10
+    spinLogsBtn.Parent = grindingView
+    CreateCorner(spinLogsBtn, 4)
+    spinLogsBtn.MouseButton1Click:Connect(function()
+        State.SpinWin.Visible = not State.SpinWin.Visible
+    end)
+
     CreateGrindingToggle(grindingView, "Auto Claim Quests", 71, "AutoClaimQuestsEnabled")
     CreateGrindingToggle(grindingView, "Auto Claim Daily", 104, "AutoClaimDailyEnabled")
     CreateGrindingToggle(grindingView, "Auto Brew Cauldron", 137, "AutoBrewEnabled")
 
-    -- VIEW 4: PLAYER MODIFICATIONS (SPEED & JUMP BONUS)
+    local brewLogsBtn = Instance.new("TextButton")
+    brewLogsBtn.Size = UDim2.new(0, 80, 0, 22)
+    brewLogsBtn.Position = UDim2.new(1, -145, 0, 139)
+    brewLogsBtn.BackgroundColor3 = Color3.fromRGB(31, 111, 235)
+    brewLogsBtn.Text = "Show Logs"
+    brewLogsBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    brewLogsBtn.Font = Enum.Font.GothamBold
+    brewLogsBtn.TextSize = 10
+    brewLogsBtn.Parent = grindingView
+    CreateCorner(brewLogsBtn, 4)
+    brewLogsBtn.MouseButton1Click:Connect(function()
+        State.BrewWin.Visible = not State.BrewWin.Visible
+    end)
+
     local playerView = Instance.new("ScrollingFrame")
     playerView.Name = "PlayerView"
     playerView.Size = UDim2.new(1, 0, 1, 0)
     playerView.BackgroundTransparency = 1
     playerView.Visible = false
-    playerView.CanvasSize = UDim2.new(0, 0, 0, 150)
+    playerView.CanvasSize = UDim2.new(0, 0, 0, 190)
     playerView.ScrollBarThickness = 4
     playerView.Parent = contentFrame
     State.Views["Player"] = playerView
 
-    CreateGrindingToggle(playerView, "Enable Custom Speed (+)", 5, "WalkSpeedEnabled")
-    
+    CreateGrindingToggle(playerView, "Enable Player ESP (Wallhack)", 5, "PlayerESPEnabled")
+    CreateGrindingToggle(playerView, "Enable Custom Speed (+)", 38, "WalkSpeedEnabled")
+
     local speedSliderLbl = Instance.new("TextLabel")
     speedSliderLbl.Size = UDim2.new(1, 0, 0, 18)
-    speedSliderLbl.Position = UDim2.new(0, 0, 0, 36)
+    speedSliderLbl.Position = UDim2.new(0, 0, 0, 68)
     speedSliderLbl.BackgroundTransparency = 1
     speedSliderLbl.Text = "Speed Bonus: +" .. CONFIG.Settings.WalkSpeedBonus .. " (0 - 100)"
     speedSliderLbl.TextColor3 = Color3.fromRGB(170, 170, 180)
@@ -1203,7 +1384,7 @@ local function BuildGUI()
 
     local speedBar = Instance.new("Frame")
     speedBar.Size = UDim2.new(1, 0, 0, 10)
-    speedBar.Position = UDim2.new(0, 0, 0, 56)
+    speedBar.Position = UDim2.new(0, 0, 0, 88)
     speedBar.BackgroundColor3 = Color3.fromRGB(30, 33, 42)
     speedBar.Parent = playerView
     CreateCorner(speedBar, 5)
@@ -1231,7 +1412,7 @@ local function BuildGUI()
         end
     end)
 
-    local jumpToggleY = 82
+    local jumpToggleY = 114
     CreateGrindingToggle(playerView, "Enable Custom Jump (+)", jumpToggleY, "JumpPowerEnabled")
 
     local jumpSliderLbl = Instance.new("TextLabel")
@@ -1275,16 +1456,17 @@ local function BuildGUI()
         end
     end)
 
-    -- VIEW 5: SETTINGS PANEL
-    local settingsView = Instance.new("Frame")
+    local settingsView = Instance.new("ScrollingFrame")
     settingsView.Name = "SettingsView"
     settingsView.Size = UDim2.new(1, 0, 1, 0)
     settingsView.BackgroundTransparency = 1
     settingsView.Visible = false
+    settingsView.CanvasSize = UDim2.new(0, 0, 0, 220)
+    settingsView.ScrollBarThickness = 4
     settingsView.Parent = contentFrame
     State.Views["Settings"] = settingsView
 
-    local function CreateToggleSetting(name, yPos, configKey)
+    local function CreateToggleSetting(parentView, name, yPos, configKey)
         local lbl = Instance.new("TextLabel")
         lbl.Size = UDim2.new(0.7, 0, 0, 30)
         lbl.Position = UDim2.new(0, 0, 0, yPos)
@@ -1294,7 +1476,7 @@ local function BuildGUI()
         lbl.Font = Enum.Font.Gotham
         lbl.TextSize = 12
         lbl.TextXAlignment = Enum.TextXAlignment.Left
-        lbl.Parent = settingsView
+        lbl.Parent = parentView
 
         local btn = Instance.new("TextButton")
         btn.Size = UDim2.new(0, 60, 0, 26)
@@ -1304,7 +1486,7 @@ local function BuildGUI()
         btn.TextColor3 = Color3.fromRGB(255, 255, 255)
         btn.Font = Enum.Font.GothamBold
         btn.TextSize = 11
-        btn.Parent = settingsView
+        btn.Parent = parentView
         CreateCorner(btn, 6)
 
         btn.MouseButton1Click:Connect(function()
@@ -1315,14 +1497,50 @@ local function BuildGUI()
         end)
     end
 
-    CreateToggleSetting("Anti-AFK Bypass", 5, "AntiAfkEnabled")
-    CreateToggleSetting("Mod / High-Rank Detector", 42, "ModDetectorEnabled")
-    CreateToggleSetting("Enable Visual Highlighting", 79, "HighlightsEnabled")
-    CreateToggleSetting("Display Floating Text Labels", 116, "DisplayLabels")
+    CreateToggleSetting(settingsView, "Anti-AFK Bypass", 5, "AntiAfkEnabled")
+    CreateToggleSetting(settingsView, "Mod Detector", 42, "ModDetectorEnabled")
+    CreateToggleSetting(settingsView, "Enable Visual Highlighting", 79, "HighlightsEnabled")
+    CreateToggleSetting(settingsView, "Display Floating Text Labels", 116, "DisplayLabels")
+
+    local bindLbl = Instance.new("TextLabel")
+    bindLbl.Size = UDim2.new(0.5, 0, 0, 30)
+    bindLbl.Position = UDim2.new(0, 0, 0, 153)
+    bindLbl.BackgroundTransparency = 1
+    bindLbl.Text = "Toggle Menu Keybind"
+    bindLbl.TextColor3 = Color3.fromRGB(220, 220, 230)
+    bindLbl.Font = Enum.Font.Gotham
+    bindLbl.TextSize = 12
+    bindLbl.TextXAlignment = Enum.TextXAlignment.Left
+    bindLbl.Parent = settingsView
+
+    local bindBtn = Instance.new("TextButton")
+    bindBtn.Size = UDim2.new(0, 100, 0, 26)
+    bindBtn.Position = UDim2.new(1, -100, 0, 155)
+    bindBtn.BackgroundColor3 = Color3.fromRGB(31, 111, 235)
+    bindBtn.Text = tostring(CONFIG.Settings.ToggleKey.Name)
+    bindBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    bindBtn.Font = Enum.Font.GothamBold
+    bindBtn.TextSize = 11
+    bindBtn.Parent = settingsView
+    CreateCorner(bindBtn, 6)
+
+    bindBtn.MouseButton1Click:Connect(function()
+        State.IsListeningForKey = true
+        bindBtn.Text = "Press any key..."
+        local conn
+        conn = UserInputService.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.Keyboard then
+                CONFIG.Settings.ToggleKey = input.KeyCode
+                bindBtn.Text = tostring(input.KeyCode.Name)
+                State.IsListeningForKey = false
+                conn:Disconnect()
+            end
+        end)
+    end)
 
     local unloadBtn = Instance.new("TextButton")
     unloadBtn.Size = UDim2.new(1, 0, 0, 36)
-    unloadBtn.Position = UDim2.new(0, 0, 1, -40)
+    unloadBtn.Position = UDim2.new(0, 0, 0, 200)
     unloadBtn.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
     unloadBtn.Text = "Completely Unload Script"
     unloadBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -1331,8 +1549,22 @@ local function BuildGUI()
     unloadBtn.Parent = settingsView
     CreateCorner(unloadBtn, 6)
 
+    local isConfirmingUnload = false
     unloadBtn.MouseButton1Click:Connect(function()
-        UnloadScript()
+        if not isConfirmingUnload then
+            isConfirmingUnload = true
+            unloadBtn.Text = "Click Again to Confirm Unload"
+            unloadBtn.BackgroundColor3 = Color3.fromRGB(255, 0, 0)
+            task.delay(3, function()
+                isConfirmingUnload = false
+                if unloadBtn then
+                    unloadBtn.Text = "Completely Unload Script"
+                    unloadBtn.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
+                end
+            end)
+        else
+            UnloadScript()
+        end
     end)
 
     CreateWaypointUI()
@@ -1427,9 +1659,6 @@ PopulateFinderList = function()
     end
 end
 
---------------------------------------------------------------------------------
--- 13. INITIALIZATION & LIVE LOOPS
---------------------------------------------------------------------------------
 local function Initialize()
     BuildGUI()
     SetupAntiAfk()
@@ -1438,7 +1667,7 @@ local function Initialize()
     PopulateFinderList()
 
     local lastScan = 0
-    local renderConnection = RunService.RenderStepped:Connect(function(dt)
+    local renderConn = RunService.RenderStepped:Connect(function(dt)
         lastScan = lastScan + dt
         if CONFIG.Settings.AutoRefresh and lastScan >= CONFIG.Settings.RefreshInterval then
             lastScan = 0
@@ -1450,6 +1679,7 @@ local function Initialize()
         StepAutoWalk()
         StepAntiAfk(dt)
         ApplyPlayerModifications()
+        UpdatePlayerESP()
 
         if State.StatsLabelRef then
             local scriptRuntime = math.floor(tick() - State.ScriptStartTime)
@@ -1467,15 +1697,15 @@ local function Initialize()
             )
         end
     end)
-    table.insert(State.Connections, renderConnection)
+    table.insert(State.Connections, renderConn)
 
-    local charConnection = LocalPlayer.CharacterAdded:Connect(function()
+    local charConn = LocalPlayer.CharacterAdded:Connect(function()
         task.wait(1)
         State.HasCapturedOriginals = false
         ScanForCollectibles()
         if State.ActiveTab == "Finder" then PopulateFinderList() end
     end)
-    table.insert(State.Connections, charConnection)
+    table.insert(State.Connections, charConn)
 end
 
 Initialize()
