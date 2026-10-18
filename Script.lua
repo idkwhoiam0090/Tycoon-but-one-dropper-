@@ -17,6 +17,15 @@ local ActionRemote = RemotesFolder and RemotesFolder:FindFirstChild("Action")
 local NetRemote = RemotesFolder and RemotesFolder:FindFirstChild("Net")
 local TrackRemote = RemotesFolder and RemotesFolder:FindFirstChild("Track")
 
+local SharedFolder = ReplicatedStorage:WaitForChild("Shared", 5)
+local SharedHalloweenModule = SharedFolder and SharedFolder:FindFirstChild("Halloween")
+local SharedHalloween = nil
+if SharedHalloweenModule then
+    pcall(function()
+        SharedHalloween = require(SharedHalloweenModule)
+    end)
+end
+
 local CONFIG = {
     MysteryCrate = {
         CategoryName = "Mystery Crates",
@@ -300,20 +309,38 @@ task.spawn(function()
     end
 end)
 
+-- AUTO BREW CAULDRON (AUTOMATIC GUI MANAGEMENT + TRUE REWARD CAPTURE)
 task.spawn(function()
     while true do
-        task.wait(2.5)
+        task.wait(2.2)
         if not State.GuiInstance then break end
         if CONFIG.Settings.AutoBrewEnabled and CONFIG.Settings.BrewsCompleted < CONFIG.Settings.BrewLimit then
             pcall(function()
                 local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
                 local hudMain = playerGui and playerGui:FindFirstChild("HUD") and playerGui.HUD:FindFirstChild("Main")
-                local brewBtn = hudMain and hudMain:FindFirstChild("Halloween") 
-                    and hudMain.Halloween:FindFirstChild("Body")
-                    and hudMain.Halloween.Body:FindFirstChild("Cauldron")
-                    and hudMain.Halloween.Body.Cauldron:FindFirstChild("Brew")
+                if not hudMain then return end
 
-                if brewBtn and brewBtn.Visible then
+                local halFrame = hudMain:FindFirstChild("Halloween")
+                local cauldronFrame = halFrame and halFrame:FindFirstChild("Body") and halFrame.Body:FindFirstChild("Cauldron")
+                local brewBtn = cauldronFrame and cauldronFrame:FindFirstChild("Brew")
+
+                -- If the Halloween menu is closed, force it open
+                if halFrame and not halFrame.Visible then
+                    local openHalloweenBtn = hudMain.Right:FindFirstChild("Halloween") or hudMain:FindFirstChild("HalloweenButton", true)
+                    if openHalloweenBtn then
+                        local absPos = openHalloweenBtn.AbsolutePosition
+                        local absSize = openHalloweenBtn.AbsoluteSize
+                        local inset, _ = GuiService:GetGuiInset()
+                        VirtualInputManager:SendMouseButtonEvent(absPos.X + absSize.X/2, absPos.Y + absSize.Y/2 + inset.Y, 0, true, game, 1)
+                        task.wait(0.04)
+                        VirtualInputManager:SendMouseButtonEvent(absPos.X + absSize.X/2, absPos.Y + absSize.Y/2 + inset.Y, 0, false, game, 1)
+                        task.wait(0.2)
+                    else
+                        halFrame.Visible = true
+                    end
+                end
+
+                if brewBtn then
                     for _, child in ipairs(brewBtn:GetDescendants()) do
                         if child:IsA("GuiObject") and child ~= brewBtn then
                             child.Active = false
@@ -326,30 +353,51 @@ task.spawn(function()
                     local clickX = absPos.X + (absSize.X / 2)
                     local clickY = absPos.Y + (absSize.Y / 2) + inset.Y
 
+                    -- Send click to initiate brew
                     VirtualInputManager:SendMouseButtonEvent(clickX, clickY, 0, true, game, 1)
                     task.wait(0.04)
                     VirtualInputManager:SendMouseButtonEvent(clickX, clickY, 0, false, game, 1)
 
-                    task.wait(0.35)
+                    -- Allow brief delay for brew animation and reward popup to populate
+                    task.wait(0.4)
 
-                    local prizeName = nil
-                    local cauldronContainer = hudMain.Halloween.Body.Cauldron
-                    for _, d in ipairs(cauldronContainer:GetDescendants()) do
-                        if d:IsA("TextLabel") and d.Visible and #d.Text > 1 then
-                            local txt = d.Text
-                            if txt ~= "BREW" and txt ~= "75" and txt ~= "THE CAULDRON" and not txt:find("pity") then
-                                prizeName = txt
+                    -- Scrape dynamic popups for true reward name
+                    local dynamicPrize = nil
+
+                    -- 1. Check for newly spawned notification / popup banners across HUD
+                    for _, popup in ipairs(hudMain:GetChildren()) do
+                        if (popup.Name:find("Popup") or popup.Name:find("Reward") or popup.Name:find("Notice") or popup.Name:find("Toast") or popup.Name:find("Banner")) and popup.Visible then
+                            local lbl = popup:FindFirstChildWhichIsA("TextLabel", true)
+                            if lbl and #lbl.Text > 1 then
+                                dynamicPrize = lbl.Text
                                 break
                             end
                         end
                     end
 
-                    if not prizeName then
-                        prizeName = "Cauldron Brewed (-75 Candy)"
+                    -- 2. Check Cauldron center result animation display
+                    if not dynamicPrize and cauldronFrame then
+                        local centerPot = cauldronFrame:FindFirstChild("Pot") or cauldronFrame:FindFirstChild("Center") or cauldronFrame:FindFirstChild("Result")
+                        if centerPot then
+                            for _, txtObj in ipairs(centerPot:GetDescendants()) do
+                                if txtObj:IsA("TextLabel") and txtObj.Visible and #txtObj.Text > 1 and txtObj.Text ~= "BREW" then
+                                    dynamicPrize = txtObj.Text
+                                    break
+                                end
+                            end
+                        end
                     end
 
+                    -- 3. Fallback clean label
+                    if not dynamicPrize then
+                        dynamicPrize = "Cauldron Brewed (-75 Candy)"
+                    end
+
+                    -- Clean up any HTML/XML tags (like <b></b>) from the string
+                    dynamicPrize = dynamicPrize:gsub("<[^>]-b>", ""):gsub("<[^>]-i>", ""):gsub("<[^>]->", "")
+
                     CONFIG.Settings.BrewsCompleted = CONFIG.Settings.BrewsCompleted + 1
-                    AddLogEntry("Brew", string.format("%s (x%d)", prizeName, CONFIG.Settings.BrewsCompleted))
+                    AddLogEntry("Brew", string.format("%s (x%d)", dynamicPrize, CONFIG.Settings.BrewsCompleted))
                 end
             end)
         end
