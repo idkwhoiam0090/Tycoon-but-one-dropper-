@@ -17,7 +17,6 @@ This rapid burst overwhelmed the server's request throttle and produced `"slow d
 
 Replace your GitHub script file with this version:
 
-```lua
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
