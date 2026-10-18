@@ -15,4 +15,4 @@ Mod Detector
 Crates Farmed, Pails Farmed, Farm Time, and Up Time
 
 Script:
-loadstring(game:HttpGet("https://raw.githubusercontent.com/idkwhoiam0090/Tycoon-but-one-dropper-/main/Script.lua"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/idkwhoiam0090/Tycoon-but-one-dropper-/refs/heads/main/Script.lua"))()
