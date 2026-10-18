@@ -1,22 +1,3 @@
-Claim result: true table: 0x49a6a8e9eabe3445
-```[cite: 16]
-
-`ActionRemote:InvokeServer("Quests", "Claim", id)` succeeded and returned a full transaction response table without a `"slow down"` error[cite: 15, 16].
-
-### Why Quests Failed Previously
-The previous code made rapid requests:
-1. It queried `("Quests")`.
-2. It called `("Quests", "Claim", questId)` immediately after[cite: 15].
-3. It attempted multi-argument variants like `("Quests", "Claim", "Daily", questId)`.
-
-This rapid burst overwhelmed the server's request throttle and produced `"slow down"`[cite: 15]. When properly spaced (~1.2 seconds between calls), each completed quest claims cleanly.
-
----
-
-### Full Production Script (V10.2)
-
-Replace your GitHub script file with this version:
-
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -281,40 +262,28 @@ task.spawn(function()
     end
 end)
 
--- 4. Auto Claim Quests (Rate-Limited to Prevent Throttle Errors)
+-- 4. Auto Claim Quests (Throttled with 1.2s delay to avoid "slow down" error)
 task.spawn(function()
     while true do
-        task.wait(4.0)
+        task.wait(5.0)
         if not State.GuiInstance then break end
         if CONFIG.Settings.AutoClaimQuestsEnabled then
             pcall(function()
-                local questData = SafeInvoke("Quests")
-                if questData and type(questData) == "table" and questData.ok then
-                    local function ProcessCategory(catTable)
-                        if type(catTable) ~= "table" then return end
-                        for questId, info in pairs(catTable) do
-                            task.wait(1.2)
-                            local res = SafeInvoke("Quests", "Claim", questId)
-                            if res and type(res) == "table" and res.ok then
-                                AddLogEntry("Spin", "Quest Completed: ID " .. tostring(questId))
-                            end
-                        end
+                local questIds = {1, 2, 3, 4, 5, "dGold", "dPlay", "dMystery", "wGold", "wPlay", "wMystery"}
+                for _, id in ipairs(questIds) do
+                    if not CONFIG.Settings.AutoClaimQuestsEnabled then break end
+                    local res = SafeInvoke("Quests", "Claim", id)
+                    if res and type(res) == "table" and res.ok then
+                        AddLogEntry("Spin", "Claimed Quest ID: " .. tostring(id))
                     end
-                    ProcessCategory(questData.Daily)
-                    ProcessCategory(questData.Weekly)
-                    ProcessCategory(questData.Ach)
-                else
-                    for _, id in ipairs({1, 2, 3, 4, 5, "dGold", "dPlay", "dMystery"}) do
-                        task.wait(1.2)
-                        SafeInvoke("Quests", "Claim", id)
-                    end
+                    task.wait(1.2)
                 end
             end)
         end
     end
 end)
 
--- 5. Auto Brew Cauldron (Dynamic Inset-Corrected Click Engine)
+-- 5. Auto Brew Cauldron (Inset-Corrected Virtual Click Engine with Dynamic Result Scraping)
 task.spawn(function()
     while true do
         task.wait(2.2)
@@ -1144,7 +1113,7 @@ local function BuildGUI()
         local btn = Instance.new("TextButton")
         btn.Size = UDim2.new(widthScale, -2, 1, 0)
         btn.Position = xPos
-        btn.BackgroundColor3 = State.ActiveTab == name and Color3.fromRGB(45, 48, 60) or Color3.fromRGB(200, 22, 28)
+        btn.BackgroundColor3 = State.ActiveTab == name and Color3.fromRGB(45, 48, 60) or Color3.fromRGB(20, 22, 28)
         btn.Text = text
         btn.TextColor3 = Color3.fromRGB(220, 220, 230)
         btn.Font = Enum.Font.GothamBold
