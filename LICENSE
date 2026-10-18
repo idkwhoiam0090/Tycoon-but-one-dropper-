@@ -1,1744 +1,661 @@
-Claim result: true table: 0x49a6a8e9eabe3445
-```[cite: 16]
-
-`ActionRemote:InvokeServer("Quests", "Claim", id)` succeeded and returned a full transaction response table without a `"slow down"` error[cite: 15, 16].
-
-### Why Quests Failed Previously
-The previous code made rapid requests:
-1. It queried `("Quests")`.
-2. It called `("Quests", "Claim", questId)` immediately after[cite: 15].
-3. It attempted multi-argument variants like `("Quests", "Claim", "Daily", questId)`.
-
-This rapid burst overwhelmed the server's request throttle and produced `"slow down"`[cite: 15]. When properly spaced (~1.2 seconds between calls), each completed quest claims cleanly.
-
----
-
-### Full Production Script (V10.2)
-
-Replace your GitHub script file with this version:
-
-```lua
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
-local CollectionService = game:GetService("CollectionService")
-local PathfindingService = game:GetService("PathfindingService")
-local VirtualUser = game:GetService("VirtualUser")
-local VirtualInputManager = game:GetService("VirtualInputManager")
-local GuiService = game:GetService("GuiService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local StarterGui = game:GetService("StarterGui")
-
-local LocalPlayer = Players.LocalPlayer
-local Camera = workspace.CurrentCamera
-
-local RemotesFolder = ReplicatedStorage:WaitForChild("Remotes", 5)
-local ActionRemote = RemotesFolder and RemotesFolder:FindFirstChild("Action")
-local NetRemote = RemotesFolder and RemotesFolder:FindFirstChild("Net")
-local TrackRemote = RemotesFolder and RemotesFolder:FindFirstChild("Track")
-
-local CONFIG = {
-    MysteryCrate = {
-        CategoryName = "Mystery Crates",
-        Names = {"Mystery Crate", "MysteryCrate", "Crate", "CrateSpawn"},
-        Tags = {"MysteryCrateTag", "CrateTag", "MysteryCrate"},
-        Color = Color3.fromRGB(255, 170, 0),
-        FolderNames = {"Crates", "MysteryCrates", "SpawnedCollectibles"}
-    },
-    CandyPail = {
-        CategoryName = "Candy Pails",
-        Names = {"Candy Pail", "CandyPail", "CandyBucket", "Pail", "Candy", "HalloweenBucket"},
-        Tags = {"CandyPailTag", "PailTag", "CandyPail"},
-        Color = Color3.fromRGB(255, 85, 255),
-        FolderNames = {"CandyPails", "Pails", "EventCollectibles", "Candy"}
-    },
-    Settings = {
-        HighlightsEnabled = true,
-        DisplayLabels = true,
-        DisplayDistance = true,
-        AutoRefresh = true,
-        RefreshInterval = 2.0,
-        FillTransparency = 0.7,
-        OutlineTransparency = 0.1,
-        StopDistance = 3,
-        AutoFarmEnabled = false,
-        AntiAfkEnabled = true,
-        AutoRebirthEnabled = false,
-        AutoSpinWheelEnabled = false,
-        AutoClaimQuestsEnabled = false,
-        AutoClaimDailyEnabled = false,
-        ModDetectorEnabled = true,
-        PlayerESPEnabled = false,
-        WalkSpeedEnabled = false,
-        WalkSpeedBonus = 16,
-        JumpPowerEnabled = false,
-        JumpPowerBonus = 50,
-        AutoBrewEnabled = false,
-        BrewLimit = 999999,
-        BrewsCompleted = 0,
-        ToggleKey = Enum.KeyCode.RightShift
-    }
-}
-
-local State = {
-    ActiveTab = "Finder",
-    CategoryFilter = "All",
-    SearchQuery = "",
-    DetectedCollectibles = {},
-    CurrentTrackedTarget = nil,
-    AutoWalkEnabled = false,
-    OriginalWalkSpeed = 16,
-    OriginalJumpPower = 50,
-    HasCapturedOriginals = false,
-    CratesClaimed = 0,
-    PailsClaimed = 0,
-    ScriptStartTime = tick(),
-    AutoFarmStartTime = 0,
-    PreviousTargetInstance = nil,
-    PreviousTargetCategory = nil,
-    Waypoints = {},
-    CurrentWaypointIndex = 1,
-    LastPathCalcTick = 0,
-    LastPosition = Vector3.zero,
-    StuckTimer = 0,
-    IsComputingPath = false,
-    Highlights = {},
-    BillboardGuis = {},
-    PlayerESPs = {},
-    Connections = {},
-    GuiInstance = nil,
-    Views = {},
-    StatsLabelRef = nil,
-    IsMinimized = false,
-    IsListeningForKey = false,
-    LastAntiAfkTick = 0,
-    SpinLogs = {},
-    BrewLogs = {},
-    SpinLogLabels = {},
-    BrewLogLabels = {},
-    SpinWin = nil,
-    BrewWin = nil
-}
-
-local function GetCharacter() return LocalPlayer.Character end
-local function GetHumanoid() local c = GetCharacter() return c and c:FindFirstChildWhichIsA("Humanoid") end
-local function GetRootPart() local c = GetCharacter() return c and c:FindFirstChild("HumanoidRootPart") end
-local function GetCharacterPosition() local r = GetRootPart() return r and r.Position end
-
-local function CalculateDistance(pos)
-    local cp = GetCharacterPosition()
-    if cp then return math.floor((pos - cp).Magnitude) end
-    return 999999
-end
-
-local function GetPrimaryPart(obj)
-    if obj:IsA("BasePart") then return obj
-    elseif obj:IsA("Model") then return obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart", true) end
-    return nil
-end
-
-local function CreateCorner(parent, radius)
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, radius)
-    corner.Parent = parent
-    return corner
-end
-
-local function CreateStroke(parent, color, thickness)
-    local stroke = Instance.new("UIStroke")
-    stroke.Color = color
-    stroke.Thickness = thickness
-    stroke.Parent = parent
-    return stroke
-end
-
-local function FormatTime(totalSeconds)
-    local m = math.floor(totalSeconds / 60)
-    local s = totalSeconds % 60
-    return string.format("%02d:%02d", m, s)
-end
-
-local function AddLogEntry(logType, message)
-    local targetList = (logType == "Spin") and State.SpinLogs or State.BrewLogs
-    local targetLabels = (logType == "Spin") and State.SpinLogLabels or State.BrewLogLabels
-    local formatted = string.format("[%s] %s", os.date("%H:%M:%S"), tostring(message))
-
-    table.insert(targetList, 1, formatted)
-    if #targetList > 10 then table.remove(targetList, 11) end
-
-    for i = 1, 10 do
-        if targetLabels[i] then targetLabels[i].Text = targetList[i] or "" end
-    end
-end
-
-local function SafeInvoke(...)
-    if not ActionRemote then return nil end
-    local args = {...}
-    local success, res = pcall(function()
-        return ActionRemote:InvokeServer(unpack(args))
-    end)
-    if success then return res end
-    return nil
-end
-
-local function SafeFireEvent(...)
-    local args = {...}
-    if NetRemote then pcall(function() NetRemote:FireServer(unpack(args)) end) end
-    if TrackRemote then pcall(function() TrackRemote:FireServer(unpack(args)) end) end
-end
-
-local function GetPlayerCandy()
-    local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
-    local candyVal = leaderstats and (leaderstats:FindFirstChild("Candy") or leaderstats:FindFirstChild("Candies"))
-    if candyVal and candyVal:IsA("ValueBase") then return candyVal.Value end
-    local dataFolder = LocalPlayer:FindFirstChild("Candy") or LocalPlayer:FindFirstChild("Data")
-    if dataFolder and dataFolder:FindFirstChild("Candy") then return dataFolder.Candy.Value end
-    return nil
-end
-
-local function GetPlayerCash()
-    local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
-    local cashVal = leaderstats and (leaderstats:FindFirstChild("Cash") or leaderstats:FindFirstChild("Money"))
-    if cashVal and cashVal:IsA("ValueBase") then return cashVal.Value end
-    return nil
-end
-
--- 1. Auto Rebirth
-task.spawn(function()
-    while true do
-        task.wait(3.0)
-        if not State.GuiInstance then break end
-        if CONFIG.Settings.AutoRebirthEnabled then
-            pcall(function()
-                SafeInvoke("Rebirth")
-                SafeInvoke("Rebirth", "Buy")
-                SafeFireEvent("Rebirth")
-            end)
-        end
-    end
-end)
-
--- 2. Auto Spin Wheel
-task.spawn(function()
-    while true do
-        task.wait(5.0)
-        if not State.GuiInstance then break end
-        if CONFIG.Settings.AutoSpinWheelEnabled then
-            pcall(function()
-                local res = SafeInvoke("Spin", "Roll") or SafeInvoke("Wheel", "Spin") or SafeInvoke("Spin")
-                if res and type(res) == "table" and res.ok then
-                    AddLogEntry("Spin", res.msg or res.Prize or res.Reward or "Spin Token Used")
-                else
-                    local hudMain = LocalPlayer.PlayerGui:FindFirstChild("HUD") and LocalPlayer.PlayerGui.HUD:FindFirstChild("Main")
-                    if hudMain then
-                        local spinBtn = hudMain.Right:FindFirstChild("Spin")
-                        if spinBtn and spinBtn.Visible then
-                            local absPos = spinBtn.AbsolutePosition
-                            local absSize = spinBtn.AbsoluteSize
-                            local inset, _ = GuiService:GetGuiInset()
-                            local cx = absPos.X + absSize.X / 2
-                            local cy = absPos.Y + absSize.Y / 2 + inset.Y
-
-                            VirtualInputManager:SendMouseButtonEvent(cx, cy, 0, true, game, 1)
-                            task.wait(0.04)
-                            VirtualInputManager:SendMouseButtonEvent(cx, cy, 0, false, game, 1)
-
-                            task.wait(0.3)
-                            for _, child in ipairs(hudMain:GetDescendants()) do
-                                if child:IsA("GuiButton") and child.Visible then
-                                    local t = child.Name:lower() .. " " .. (child:IsA("TextButton") and child.Text:lower() or "")
-                                    if t:find("spin") or t:find("roll") or t:find("free") then
-                                        local p = child.AbsolutePosition
-                                        local s = child.AbsoluteSize
-                                        VirtualInputManager:SendMouseButtonEvent(p.X + s.X/2, p.Y + s.Y/2 + inset.Y, 0, true, game, 1)
-                                        task.wait(0.04)
-                                        VirtualInputManager:SendMouseButtonEvent(p.X + s.X/2, p.Y + s.Y/2 + inset.Y, 0, false, game, 1)
-                                        AddLogEntry("Spin", "Claimed Free Wheel Spin")
-                                        break
-                                    end
-                                end
-                            end
-                        end
-                    end
-                end
-            end)
-        end
-    end
-end)
-
--- 3. Auto Claim Daily
-task.spawn(function()
-    while true do
-        task.wait(6.0)
-        if not State.GuiInstance then break end
-        if CONFIG.Settings.AutoClaimDailyEnabled then
-            pcall(function()
-                local res = SafeInvoke("ClaimDaily") or SafeInvoke("Daily", "Claim")
-                if res and type(res) == "table" and res.ok then
-                    AddLogEntry("Spin", "Daily: Claimed Daily Reward!")
-                end
-            end)
-        end
-    end
-end)
-
--- 4. Auto Claim Quests (Rate-Limited to Prevent Throttle Errors)
-task.spawn(function()
-    while true do
-        task.wait(4.0)
-        if not State.GuiInstance then break end
-        if CONFIG.Settings.AutoClaimQuestsEnabled then
-            pcall(function()
-                local questData = SafeInvoke("Quests")
-                if questData and type(questData) == "table" and questData.ok then
-                    local function ProcessCategory(catTable)
-                        if type(catTable) ~= "table" then return end
-                        for questId, info in pairs(catTable) do
-                            task.wait(1.2)
-                            local res = SafeInvoke("Quests", "Claim", questId)
-                            if res and type(res) == "table" and res.ok then
-                                AddLogEntry("Spin", "Quest Completed: ID " .. tostring(questId))
-                            end
-                        end
-                    end
-                    ProcessCategory(questData.Daily)
-                    ProcessCategory(questData.Weekly)
-                    ProcessCategory(questData.Ach)
-                else
-                    for _, id in ipairs({1, 2, 3, 4, 5, "dGold", "dPlay", "dMystery"}) do
-                        task.wait(1.2)
-                        SafeInvoke("Quests", "Claim", id)
-                    end
-                end
-            end)
-        end
-    end
-end)
-
--- 5. Auto Brew Cauldron (Dynamic Inset-Corrected Click Engine)
-task.spawn(function()
-    while true do
-        task.wait(2.2)
-        if not State.GuiInstance then break end
-        if CONFIG.Settings.AutoBrewEnabled and CONFIG.Settings.BrewsCompleted < CONFIG.Settings.BrewLimit then
-            pcall(function()
-                local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
-                local hudMain = playerGui and playerGui:FindFirstChild("HUD") and playerGui.HUD:FindFirstChild("Main")
-                if not hudMain then return end
-
-                local halFrame = hudMain:FindFirstChild("Halloween")
-                local cauldronFrame = halFrame and halFrame:FindFirstChild("Body") and halFrame.Body:FindFirstChild("Cauldron")
-                local brewBtn = cauldronFrame and cauldronFrame:FindFirstChild("Brew")
-
-                if not brewBtn or not brewBtn.Visible then return end
-
-                for _, child in ipairs(brewBtn:GetDescendants()) do
-                    if child:IsA("GuiObject") and child ~= brewBtn then
-                        child.Active = false
-                    end
-                end
-
-                local startCandy = GetPlayerCandy()
-                local startCash = GetPlayerCash()
-
-                local inset, _ = GuiService:GetGuiInset()
-                local absPos = brewBtn.AbsolutePosition
-                local absSize = brewBtn.AbsoluteSize
-                local clickX = absPos.X + (absSize.X / 2)
-                local clickY = absPos.Y + (absSize.Y / 2) + inset.Y
-
-                VirtualInputManager:SendMouseButtonEvent(clickX, clickY, 0, true, game, 1)
-                task.wait(0.04)
-                VirtualInputManager:SendMouseButtonEvent(clickX, clickY, 0, false, game, 1)
-
-                task.wait(0.5)
-
-                local detectedPrize = nil
-                local endCandy = GetPlayerCandy()
-                local endCash = GetPlayerCash()
-
-                if startCandy and endCandy and (endCandy - startCandy) > 0 then
-                    detectedPrize = "+150 Candy Back!"
-                elseif startCash and endCash and (endCash - startCash) > 0 then
-                    detectedPrize = string.format("Cash Payout (+$%s)", tostring(endCash - startCash))
-                end
-
-                if not detectedPrize then
-                    for _, popup in ipairs(hudMain:GetChildren()) do
-                        if popup:IsA("GuiObject") and popup.Visible and popup ~= halFrame and not popup.Name:find("Halloween") then
-                            local lbl = popup:FindFirstChildWhichIsA("TextLabel", true)
-                            if lbl and #lbl.Text > 1 then
-                                local t = lbl.Text:gsub("<[^>]-b>", ""):gsub("<[^>]->", "")
-                                if not t:lower():find("store") and not t:lower():find("cauldron") and not t:lower():find("mummy wraps") then
-                                    detectedPrize = t
-                                    break
-                                end
-                            end
-                        end
-                    end
-                end
-
-                if not detectedPrize then
-                    detectedPrize = "Cauldron Brew (-75 Candy)"
-                end
-
-                CONFIG.Settings.BrewsCompleted = CONFIG.Settings.BrewsCompleted + 1
-                AddLogEntry("Brew", string.format("%s (x%d)", detectedPrize, CONFIG.Settings.BrewsCompleted))
-            end)
-        end
-    end
-end)
-
-local function UpdatePlayerESP()
-    if not CONFIG.Settings.PlayerESPEnabled then
-        for plr, esp in pairs(State.PlayerESPs) do
-            if esp.Highlight then esp.Highlight:Destroy() end
-            if esp.Billboard then esp.Billboard:Destroy() end
-        end
-        table.clear(State.PlayerESPs)
-        return
-    end
-
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer and player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
-            local char = player.Character
-            if not State.PlayerESPs[player] or State.PlayerESPs[player].Character ~= char then
-                if State.PlayerESPs[player] then
-                    if State.PlayerESPs[player].Highlight then State.PlayerESPs[player].Highlight:Destroy() end
-                    if State.PlayerESPs[player].Billboard then State.PlayerESPs[player].Billboard:Destroy() end
-                end
-
-                local hl = Instance.new("Highlight")
-                hl.FillColor = Color3.fromRGB(255, 50, 50)
-                hl.OutlineColor = Color3.fromRGB(255, 255, 255)
-                hl.FillTransparency = 0.6
-                hl.OutlineTransparency = 0.2
-                hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-                hl.Parent = char
-
-                local bb = Instance.new("BillboardGui")
-                bb.Size = UDim2.new(0, 200, 0, 30)
-                bb.StudsOffset = Vector3.new(0, 3.5, 0)
-                bb.AlwaysOnTop = true
-
-                local txt = Instance.new("TextLabel")
-                txt.Size = UDim2.new(1, 0, 1, 0)
-                txt.BackgroundTransparency = 1
-                txt.Text = player.Name
-                txt.TextColor3 = Color3.fromRGB(255, 255, 255)
-                txt.TextStrokeTransparency = 0.2
-                txt.Font = Enum.Font.GothamBold
-                txt.TextSize = 12
-                txt.Parent = bb
-                bb.Parent = char
-
-                State.PlayerESPs[player] = {Highlight = hl, Billboard = bb, Character = char, Label = txt}
-            else
-                local dist = CalculateDistance(char.HumanoidRootPart.Position)
-                State.PlayerESPs[player].Label.Text = player.Name .. " [" .. tostring(dist) .. "s]"
-            end
-        end
-    end
-end
-
-local function ApplyPlayerModifications()
-    local hum = GetHumanoid()
-    if not hum then return end
-
-    if not State.HasCapturedOriginals then
-        State.OriginalWalkSpeed = hum.WalkSpeed > 0 and hum.WalkSpeed or 16
-        State.OriginalJumpPower = hum.JumpPower > 0 and hum.JumpPower or 50
-        State.HasCapturedOriginals = true
-    end
-
-    local targetSpeed = State.OriginalWalkSpeed
-    if CONFIG.Settings.WalkSpeedEnabled then
-        targetSpeed = State.OriginalWalkSpeed + CONFIG.Settings.WalkSpeedBonus
-    end
-    if math.abs(hum.WalkSpeed - targetSpeed) > 0.1 then
-        hum.WalkSpeed = targetSpeed
-    end
-
-    local targetJump = State.OriginalJumpPower
-    if CONFIG.Settings.JumpPowerEnabled then
-        targetJump = State.OriginalJumpPower + CONFIG.Settings.JumpPowerBonus
-    end
-    hum.UseJumpPower = true
-    if math.abs(hum.JumpPower - targetJump) > 0.1 then
-        hum.JumpPower = targetJump
-        pcall(function() hum.JumpHeight = targetJump / 2.5 end)
-    end
-end
-
-local function SetupAntiAfk()
-    local conn = LocalPlayer.Idled:Connect(function()
-        if CONFIG.Settings.AntiAfkEnabled then
-            pcall(function()
-                VirtualUser:CaptureController()
-                VirtualUser:ClickButton2(Vector2.new(0, 0))
-            end)
-        end
-    end)
-    table.insert(State.Connections, conn)
-end
-
-local function StepAntiAfk(dt)
-    if not CONFIG.Settings.AntiAfkEnabled then return end
-    State.LastAntiAfkTick = State.LastAntiAfkTick + dt
-    if State.LastAntiAfkTick >= 50 then
-        State.LastAntiAfkTick = 0
-        pcall(function()
-            VirtualUser:CaptureController()
-            VirtualUser:Button2Down(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
-            task.wait(0.1)
-            VirtualUser:Button2Up(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
-        end)
-    end
-end
-
-local function CheckPlayerForMod(player)
-    if player == LocalPlayer then return end
-    local nameLower = player.Name:lower()
-    local dispLower = player.DisplayName:lower()
-    local keywords = {"mod", "admin", "owner", "developer", "dev", "staff", "helper", "trial", "creator"}
-    for _, kw in ipairs(keywords) do
-        if string.find(nameLower, kw) or string.find(dispLower, kw) then
-            pcall(function()
-                StarterGui:SetCore("SendNotification", {
-                    Title = "SECURITY ALERT!",
-                    Text = "Mod joined: " .. player.Name,
-                    Duration = 10
-                })
-            end)
-            break
-        end
-    end
-end
-
-local function SetupModDetector()
-    for _, p in ipairs(Players:GetPlayers()) do CheckPlayerForMod(p) end
-    local conn = Players.PlayerAdded:Connect(function(p)
-        if CONFIG.Settings.ModDetectorEnabled then CheckPlayerForMod(p) end
-    end)
-    table.insert(State.Connections, conn)
-end
-
-local function StopAutoWalk()
-    local hum = GetHumanoid()
-    if hum then hum:MoveTo(GetCharacterPosition() or Vector3.zero) end
-    State.Waypoints = {}
-    State.CurrentWaypointIndex = 1
-    State.StuckTimer = 0
-end
-
-local function ComputePathToAsync(targetPos)
-    if State.IsComputingPath then return end
-    State.IsComputingPath = true
-
-    task.defer(function()
-        local charPos = GetCharacterPosition()
-        if not charPos then State.IsComputingPath = false return end
-
-        local path = PathfindingService:CreatePath({
-            AgentRadius = 2.5,
-            AgentHeight = 5.0,
-            AgentCanJump = true,
-            WaypointSpacing = 4.0
-        })
-
-        local success = pcall(function() path:ComputeAsync(charPos, targetPos) end)
-        if success and path.Status == Enum.PathStatus.Success then
-            State.Waypoints = path:GetWaypoints()
-            State.CurrentWaypointIndex = 2
-        else
-            local hum = GetHumanoid()
-            if hum then hum:MoveTo(targetPos) end
-        end
-        State.IsComputingPath = false
-    end)
-end
-
-local function CheckForwardObstacleAndJump()
-    local root = GetRootPart()
-    local hum = GetHumanoid()
-    if not root or not hum then return end
-
-    local rayParams = RaycastParams.new()
-    rayParams.FilterType = Enum.RaycastFilterType.Exclude
-    rayParams.FilterDescendantsInstances = {GetCharacter()}
-
-    local origin = root.Position - Vector3.new(0, 1, 0)
-    local direction = root.CFrame.LookVector * 3.5
-
-    local result = workspace:Raycast(origin, direction, rayParams)
-    if result and result.Instance and result.Instance.CanCollide then
-        hum.Jump = true
-    end
-end
-
-local function StepAutoWalk()
-    if not State.AutoWalkEnabled or not State.CurrentTrackedTarget then return end
-
-    if not State.CurrentTrackedTarget:IsDescendantOf(workspace) then
-        State.CurrentTrackedTarget = nil
-        State.AutoWalkEnabled = false
-        StopAutoWalk()
-        return
-    end
-
-    local targetPart = GetPrimaryPart(State.CurrentTrackedTarget)
-    local hum = GetHumanoid()
-    local charPos = GetCharacterPosition()
-    if not targetPart or not hum or not charPos then return end
-
-    local dist = CalculateDistance(targetPart.Position)
-    if dist <= CONFIG.Settings.StopDistance then
-        if not CONFIG.Settings.AutoFarmEnabled then
-            State.AutoWalkEnabled = false
-            State.CurrentTrackedTarget = nil
-            StopAutoWalk()
-        end
-        return
-    end
-
-    local movedDistance = (charPos - State.LastPosition).Magnitude
-    State.LastPosition = charPos
-
-    if movedDistance < 0.2 then
-        State.StuckTimer = State.StuckTimer + 0.1
-        if State.StuckTimer >= 0.8 then
-            hum.Jump = true
-            State.StuckTimer = 0
-            State.LastPathCalcTick = 0
-        end
-    else
-        State.StuckTimer = 0
-    end
-
-    CheckForwardObstacleAndJump()
-
-    local now = tick()
-    if now - State.LastPathCalcTick > 1.5 or #State.Waypoints == 0 then
-        State.LastPathCalcTick = now
-        ComputePathToAsync(targetPart.Position)
-    end
-
-    if #State.Waypoints > 0 and State.CurrentWaypointIndex <= #State.Waypoints then
-        local wp = State.Waypoints[State.CurrentWaypointIndex]
-        hum:MoveTo(wp.Position)
-
-        if wp.Action == Enum.PathWaypointAction.Jump or (wp.Position.Y - charPos.Y) > 1.5 then
-            hum.Jump = true
-        end
-
-        if (charPos - Vector3.new(wp.Position.X, charPos.Y, wp.Position.Z)).Magnitude < 3.5 then
-            State.CurrentWaypointIndex = State.CurrentWaypointIndex + 1
-        end
-    else
-        hum:MoveTo(targetPart.Position)
-    end
-end
-
-local function RemoveHighlightFor(inst)
-    if State.Highlights[inst] then State.Highlights[inst]:Destroy() State.Highlights[inst] = nil end
-    if State.BillboardGuis[inst] then State.BillboardGuis[inst]:Destroy() State.BillboardGuis[inst] = nil end
-end
-
-local function ClearAllHighlights()
-    for _, hl in pairs(State.Highlights) do hl:Destroy() end
-    table.clear(State.Highlights)
-    for _, bb in pairs(State.BillboardGuis) do bb:Destroy() end
-    table.clear(State.BillboardGuis)
-end
-
-local function ApplyHighlight(itemData)
-    local inst = itemData.Instance
-    if not inst or not inst:IsDescendantOf(workspace) then return end
-    if State.Highlights[inst] then return end
-    if not CONFIG.Settings.HighlightsEnabled then return end
-
-    local color = itemData.Category == "CandyPail" and CONFIG.CandyPail.Color or CONFIG.MysteryCrate.Color
-
-    local hl = Instance.new("Highlight")
-    hl.Name = "CollectibleHighlight"
-    hl.Adornee = inst
-    hl.FillColor = color
-    hl.OutlineColor = Color3.fromRGB(255, 255, 255)
-    hl.FillTransparency = CONFIG.Settings.FillTransparency
-    hl.OutlineTransparency = CONFIG.Settings.OutlineTransparency
-    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-    hl.Parent = inst
-    State.Highlights[inst] = hl
-
-    if CONFIG.Settings.DisplayLabels then
-        local targetPart = GetPrimaryPart(inst)
-        if targetPart then
-            local bb = Instance.new("BillboardGui")
-            bb.Name = "CollectibleBillboard"
-            bb.Adornee = targetPart
-            bb.Size = UDim2.new(0, 150, 0, 36)
-            bb.StudsOffset = Vector3.new(0, 3, 0)
-            bb.AlwaysOnTop = true
-
-            local label = Instance.new("TextLabel")
-            label.Size = UDim2.new(1, 0, 1, 0)
-            label.BackgroundTransparency = 0.4
-            label.BackgroundColor3 = Color3.fromRGB(18, 19, 24)
-            label.TextColor3 = color
-            label.Font = Enum.Font.SourceSansBold
-            label.TextSize = 13
-            label.TextWrapped = true
-
-            local distText = CONFIG.Settings.DisplayDistance and ("\n[" .. tostring(itemData.Distance) .. " studs]") or ""
-            label.Text = itemData.Name .. distText
-            label.Parent = bb
-            CreateCorner(label, 6)
-            CreateStroke(label, Color3.fromRGB(50, 52, 62), 1)
-
-            bb.Parent = inst
-            State.BillboardGuis[inst] = bb
-        end
-    end
-end
-
-local function IsCollectibleMatch(inst, categoryConfig)
-    for _, tag in ipairs(categoryConfig.Tags) do
-        if CollectionService:HasTag(inst, tag) then return true end
-    end
-    for _, name in ipairs(categoryConfig.Names) do
-        if string.find(inst.Name:lower(), name:lower(), 1, true) then return true end
-    end
-    for _, folderName in ipairs(categoryConfig.FolderNames) do
-        local folder = workspace:FindFirstChild(folderName)
-        if folder and inst:IsDescendantOf(folder) then return true end
-    end
-    return false
-end
-
-local function ScanForCollectibles()
-    if State.PreviousTargetInstance and not State.PreviousTargetInstance:IsDescendantOf(workspace) then
-        if State.PreviousTargetCategory == "MysteryCrate" then
-            State.CratesClaimed = State.CratesClaimed + 1
-        elseif State.PreviousTargetCategory == "CandyPail" then
-            State.PailsClaimed = State.PailsClaimed + 1
-        end
-        State.PreviousTargetInstance = nil
-        State.PreviousTargetCategory = nil
-    end
-
-    local found = {}
-    local seen = {}
-
-    local function EvaluateInstance(inst)
-        if seen[inst] then return end
-        local part = GetPrimaryPart(inst)
-        if not part then return end
-
-        local category = nil
-        if IsCollectibleMatch(inst, CONFIG.MysteryCrate) then
-            category = "MysteryCrate"
-        elseif IsCollectibleMatch(inst, CONFIG.CandyPail) then
-            category = "CandyPail"
-        end
-
-        if category then
-            seen[inst] = true
-            local dist = CalculateDistance(part.Position)
-            table.insert(found, {
-                Instance = inst,
-                Position = part.Position,
-                Category = category,
-                Distance = dist,
-                Name = inst.Name
-            })
-        end
-    end
-
-    for _, folderName in ipairs({"Crates", "MysteryCrates", "CandyPails", "Pails", "SpawnedCollectibles", "Spawns", "Debris"}) do
-        local folder = workspace:FindFirstChild(folderName)
-        if folder then
-            for _, child in ipairs(folder:GetChildren()) do EvaluateInstance(child) end
-        end
-    end
-
-    for _, obj in ipairs(workspace:GetChildren()) do
-        if obj:IsA("Model") or obj:IsA("BasePart") then EvaluateInstance(obj) end
-    end
-
-    table.sort(found, function(a, b) return a.Distance < b.Distance end)
-    State.DetectedCollectibles = found
-
-    for inst in pairs(State.Highlights) do
-        local present = false
-        for _, item in ipairs(found) do
-            if item.Instance == inst then present = true break end
-        end
-        if not present then RemoveHighlightFor(inst) end
-    end
-
-    for _, item in ipairs(found) do ApplyHighlight(item) end
-
-    if CONFIG.Settings.AutoFarmEnabled then
-        if (not State.CurrentTrackedTarget or not State.CurrentTrackedTarget:IsDescendantOf(workspace)) and #State.DetectedCollectibles > 0 then
-            State.CurrentTrackedTarget = State.DetectedCollectibles[1].Instance
-            State.AutoWalkEnabled = true
-        end
-    end
-
-    if State.CurrentTrackedTarget then
-        State.PreviousTargetInstance = State.CurrentTrackedTarget
-        for _, item in ipairs(found) do
-            if item.Instance == State.CurrentTrackedTarget then
-                State.PreviousTargetCategory = item.Category
-                break
-            end
-        end
-    end
-end
-
-local WaypointGui = nil
-local ArrowFrame = nil
-local DistanceText = nil
-
-local function CreateWaypointUI()
-    if WaypointGui then return end
-    WaypointGui = Instance.new("ScreenGui")
-    WaypointGui.Name = "CollectibleFinder_WaypointOverlay"
-    WaypointGui.ResetOnSpawn = false
-    WaypointGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
-
-    ArrowFrame = Instance.new("Frame")
-    ArrowFrame.Size = UDim2.new(0, 40, 0, 40)
-    ArrowFrame.AnchorPoint = Vector2.new(0.5, 0.5)
-    ArrowFrame.BackgroundTransparency = 1
-    ArrowFrame.Visible = false
-    ArrowFrame.Parent = WaypointGui
-
-    local arrowIcon = Instance.new("TextLabel")
-    arrowIcon.Size = UDim2.new(1, 0, 1, 0)
-    arrowIcon.BackgroundTransparency = 1
-    arrowIcon.Text = "▲"
-    arrowIcon.TextColor3 = Color3.fromRGB(255, 204, 0)
-    arrowIcon.TextSize = 28
-    arrowIcon.Font = Enum.Font.SourceSansBold
-    arrowIcon.Parent = ArrowFrame
-
-    DistanceText = Instance.new("TextLabel")
-    DistanceText.Size = UDim2.new(0, 100, 0, 20)
-    DistanceText.Position = UDim2.new(0.5, -50, 1, 2)
-    DistanceText.BackgroundTransparency = 0.5
-    DistanceText.BackgroundColor3 = Color3.fromRGB(15, 16, 20)
-    DistanceText.TextColor3 = Color3.fromRGB(255, 255, 255)
-    DistanceText.TextSize = 12
-    DistanceText.Font = Enum.Font.SourceSansBold
-    DistanceText.Parent = ArrowFrame
-    CreateCorner(DistanceText, 4)
-end
-
-local function UpdateWaypointTracking()
-    if not State.CurrentTrackedTarget or not State.CurrentTrackedTarget:IsDescendantOf(workspace) then
-        if ArrowFrame then ArrowFrame.Visible = false end
-        return
-    end
-
-    local primaryPart = GetPrimaryPart(State.CurrentTrackedTarget)
-    if not primaryPart then
-        if ArrowFrame then ArrowFrame.Visible = false end
-        return
-    end
-
-    local worldPos = primaryPart.Position
-    local screenPos, onScreen = Camera:WorldToViewportPoint(worldPos)
-    local viewportSize = Camera.ViewportSize
-
-    ArrowFrame.Visible = true
-    local dist = CalculateDistance(worldPos)
-    DistanceText.Text = tostring(dist) .. " studs"
-
-    if onScreen then
-        ArrowFrame.Position = UDim2.new(0, screenPos.X, 0, screenPos.Y)
-        ArrowFrame.Rotation = 180
-    else
-        local center = viewportSize / 2
-        local dir = (Vector2.new(screenPos.X, screenPos.Y) - center).Unit
-        local edgePos = center + dir * (math.min(viewportSize.X, viewportSize.Y) * 0.4)
-        ArrowFrame.Position = UDim2.new(0, edgePos.X, 0, edgePos.Y)
-        local angle = math.atan2(dir.Y, dir.X)
-        ArrowFrame.Rotation = math.deg(angle) - 90
-    end
-end
-
-local function UnloadScript()
-    for _, conn in ipairs(State.Connections) do
-        if conn and conn.Connected then conn:Disconnect() end
-    end
-    table.clear(State.Connections)
-
-    StopAutoWalk()
-    State.AutoWalkEnabled = false
-    State.CurrentTrackedTarget = nil
-    CONFIG.Settings.AutoFarmEnabled = false
-    CONFIG.Settings.AntiAfkEnabled = false
-    CONFIG.Settings.AutoRebirthEnabled = false
-    CONFIG.Settings.AutoSpinWheelEnabled = false
-    CONFIG.Settings.AutoClaimQuestsEnabled = false
-    CONFIG.Settings.AutoClaimDailyEnabled = false
-    CONFIG.Settings.AutoBrewEnabled = false
-    CONFIG.Settings.WalkSpeedEnabled = false
-    CONFIG.Settings.JumpPowerEnabled = false
-    CONFIG.Settings.PlayerESPEnabled = false
-    
-    UpdatePlayerESP()
-
-    local hum = GetHumanoid()
-    if hum and State.HasCapturedOriginals then
-        hum.WalkSpeed = State.OriginalWalkSpeed
-        hum.UseJumpPower = true
-        hum.JumpPower = State.OriginalJumpPower
-        pcall(function() hum.JumpHeight = State.OriginalJumpPower / 2.5 end)
-    end
-
-    ClearAllHighlights()
-
-    if WaypointGui then WaypointGui:Destroy() WaypointGui = nil end
-    if State.GuiInstance then State.GuiInstance:Destroy() State.GuiInstance = nil end
-end
-
-local PopulateFinderList
-
-local function SwitchTab(targetTab)
-    State.ActiveTab = targetTab
-    for tabName, viewFrame in pairs(State.Views) do
-        viewFrame.Visible = (tabName == targetTab)
-    end
-    if targetTab == "Finder" then
-        PopulateFinderList()
-    end
-end
-
-local function CreateStaticLogWindow(name, titleStr, pos, logKey)
-    local win = Instance.new("Frame")
-    win.Name = name
-    win.Size = UDim2.new(0, 240, 0, 205)
-    win.Position = pos
-    win.BackgroundColor3 = Color3.fromRGB(18, 19, 24)
-    win.Visible = false
-    win.Parent = State.GuiInstance
-    CreateCorner(win, 8)
-    CreateStroke(win, Color3.fromRGB(50, 53, 65), 1)
-
-    local titleBar = Instance.new("Frame")
-    titleBar.Size = UDim2.new(1, 0, 0, 28)
-    titleBar.BackgroundColor3 = Color3.fromRGB(26, 28, 35)
-    titleBar.Parent = win
-    CreateCorner(titleBar, 8)
-
-    local dragging, dragStart, startPos
-    titleBar.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            dragStart = input.Position
-            startPos = win.Position
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then dragging = false end
-            end)
-        end
-    end)
-    UserInputService.InputChanged:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-            local delta = input.Position - dragStart
-            win.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
-        end
-    end)
-
-    local titleText = Instance.new("TextLabel")
-    titleText.Size = UDim2.new(0.7, 0, 1, 0)
-    titleText.Position = UDim2.new(0, 10, 0, 0)
-    titleText.BackgroundTransparency = 1
-    titleText.Text = titleStr
-    titleText.TextColor3 = Color3.fromRGB(245, 245, 250)
-    titleText.Font = Enum.Font.GothamBold
-    titleText.TextSize = 12
-    titleText.TextXAlignment = Enum.TextXAlignment.Left
-    titleText.Parent = titleBar
-
-    local minBtn = Instance.new("TextButton")
-    minBtn.Size = UDim2.new(0, 20, 0, 20)
-    minBtn.Position = UDim2.new(1, -24, 0.5, -10)
-    minBtn.BackgroundColor3 = Color3.fromRGB(45, 48, 60)
-    minBtn.Text = "-"
-    minBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    minBtn.Font = Enum.Font.GothamBold
-    minBtn.TextSize = 12
-    minBtn.Parent = titleBar
-    CreateCorner(minBtn, 4)
-
-    local contentHolder = Instance.new("Frame")
-    contentHolder.Size = UDim2.new(1, -10, 1, -34)
-    contentHolder.Position = UDim2.new(0, 5, 0, 30)
-    contentHolder.BackgroundTransparency = 1
-    contentHolder.Parent = win
-
-    local labelTable = (logKey == "Spin") and State.SpinLogLabels or State.BrewLogLabels
-
-    for i = 1, 10 do
-        local row = Instance.new("TextLabel")
-        row.Size = UDim2.new(1, 0, 0, 16)
-        row.Position = UDim2.new(0, 0, 0, (i - 1) * 17)
-        row.BackgroundTransparency = 1
-        row.Text = ""
-        row.TextColor3 = Color3.fromRGB(200, 200, 210)
-        row.Font = Enum.Font.Gotham
-        row.TextSize = 10
-        row.TextXAlignment = Enum.TextXAlignment.Left
-        row.TextTruncate = Enum.TextTruncate.AtEnd
-        row.Parent = contentHolder
-        labelTable[i] = row
-    end
-
-    local isMin = false
-    minBtn.MouseButton1Click:Connect(function()
-        isMin = not isMin
-        if isMin then
-            win.Size = UDim2.new(0, 240, 0, 28)
-            contentHolder.Visible = false
-            minBtn.Text = "+"
-        else
-            win.Size = UDim2.new(0, 240, 0, 205)
-            contentHolder.Visible = true
-            minBtn.Text = "-"
-        end
-    end)
-
-    return win
-end
-
-local function BuildGUI()
-    local existing = LocalPlayer.PlayerGui:FindFirstChild("TycoonCollectibleFinderGui")
-    if existing then existing:Destroy() end
-
-    local screenGui = Instance.new("ScreenGui")
-    screenGui.Name = "TycoonCollectibleFinderGui"
-    screenGui.ResetOnSpawn = false
-    screenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
-    State.GuiInstance = screenGui
-
-    local main = Instance.new("Frame")
-    main.Name = "MainWindow"
-    main.Size = UDim2.new(0, 460, 0, 410)
-    main.Position = UDim2.new(0.5, -230, 0.5, -205)
-    main.BackgroundColor3 = Color3.fromRGB(18, 19, 24)
-    main.ClipsDescendants = true
-    main.Parent = screenGui
-
-    CreateCorner(main, 12)
-    CreateStroke(main, Color3.fromRGB(50, 53, 65), 1.5)
-
-    State.SpinWin = CreateStaticLogWindow("SpinLogsWin", "Spin Rewards Log", UDim2.new(0, 15, 0, 45), "Spin")
-    State.BrewWin = CreateStaticLogWindow("BrewLogsWin", "Brew Rewards Log", UDim2.new(0, 15, 0, 260), "Brew")
-
-    local titleBar = Instance.new("Frame")
-    titleBar.Size = UDim2.new(1, 0, 0, 38)
-    titleBar.BackgroundColor3 = Color3.fromRGB(26, 28, 35)
-    titleBar.Parent = main
-    CreateCorner(titleBar, 12)
-
-    local dragging, dragStart, startPos
-    titleBar.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            dragStart = input.Position
-            startPos = main.Position
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then dragging = false end
-            end)
-        end
-    end)
-    UserInputService.InputChanged:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-            local delta = input.Position - dragStart
-            main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
-        end
-    end)
-
-    local titleText = Instance.new("TextLabel")
-    titleText.Size = UDim2.new(0.6, 0, 1, 0)
-    titleText.Position = UDim2.new(0, 14, 0, 0)
-    titleText.BackgroundTransparency = 1
-    titleText.Text = "Tycoon Pro Automation"
-    titleText.TextColor3 = Color3.fromRGB(245, 245, 250)
-    titleText.Font = Enum.Font.GothamBold
-    titleText.TextSize = 14
-    titleText.TextXAlignment = Enum.TextXAlignment.Left
-    titleText.Parent = titleBar
-
-    local closeBtn = Instance.new("TextButton")
-    closeBtn.Size = UDim2.new(0, 28, 0, 28)
-    closeBtn.Position = UDim2.new(1, -32, 0.5, -14)
-    closeBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
-    closeBtn.Text = "X"
-    closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    closeBtn.Font = Enum.Font.GothamBold
-    closeBtn.TextSize = 12
-    closeBtn.Parent = titleBar
-    CreateCorner(closeBtn, 6)
-
-    closeBtn.MouseButton1Click:Connect(function()
-        main.Visible = false
-    end)
-
-    local minBtn = Instance.new("TextButton")
-    minBtn.Size = UDim2.new(0, 28, 0, 28)
-    minBtn.Position = UDim2.new(1, -66, 0.5, -14)
-    minBtn.BackgroundColor3 = Color3.fromRGB(45, 48, 60)
-    minBtn.Text = "-"
-    minBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    minBtn.Font = Enum.Font.GothamBold
-    minBtn.TextSize = 14
-    minBtn.Parent = titleBar
-    CreateCorner(minBtn, 6)
-
-    local contentHolder = Instance.new("Frame")
-    contentHolder.Name = "ContentHolder"
-    contentHolder.Size = UDim2.new(1, 0, 1, -38)
-    contentHolder.Position = UDim2.new(0, 0, 0, 38)
-    contentHolder.BackgroundTransparency = 1
-    contentHolder.Parent = main
-
-    minBtn.MouseButton1Click:Connect(function()
-        State.IsMinimized = not State.IsMinimized
-        if State.IsMinimized then
-            main.Size = UDim2.new(0, 460, 0, 38)
-            contentHolder.Visible = false
-            minBtn.Text = "+"
-        else
-            main.Size = UDim2.new(0, 460, 0, 410)
-            contentHolder.Visible = true
-            minBtn.Text = "-"
-        end
-    end)
-
-    local toggleConn = UserInputService.InputBegan:Connect(function(input, gameProcessed)
-        if State.IsListeningForKey then return end
-        if not gameProcessed and input.KeyCode == CONFIG.Settings.ToggleKey then
-            main.Visible = not main.Visible
-        end
-    end)
-    table.insert(State.Connections, toggleConn)
-
-    local navBar = Instance.new("Frame")
-    navBar.Size = UDim2.new(1, -20, 0, 32)
-    navBar.Position = UDim2.new(0, 10, 0, 10)
-    navBar.BackgroundColor3 = Color3.fromRGB(13, 14, 18)
-    navBar.Parent = contentHolder
-    CreateCorner(navBar, 6)
-
-    local contentFrame = Instance.new("Frame")
-    contentFrame.Name = "ContentFrame"
-    contentFrame.Size = UDim2.new(1, -20, 1, -104)
-    contentFrame.Position = UDim2.new(0, 10, 0, 50)
-    contentFrame.BackgroundTransparency = 1
-    contentFrame.Parent = contentHolder
-
-    local tabButtons = {}
-    local function CreateTabButton(name, text, widthScale, xPos)
-        local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(widthScale, -2, 1, 0)
-        btn.Position = xPos
-        btn.BackgroundColor3 = State.ActiveTab == name and Color3.fromRGB(45, 48, 60) or Color3.fromRGB(200, 22, 28)
-        btn.Text = text
-        btn.TextColor3 = Color3.fromRGB(220, 220, 230)
-        btn.Font = Enum.Font.GothamBold
-        btn.TextSize = 11
-        btn.Parent = navBar
-        CreateCorner(btn, 5)
-        tabButtons[name] = btn
-
-        btn.MouseButton1Click:Connect(function()
-            for _, b in pairs(tabButtons) do b.BackgroundColor3 = Color3.fromRGB(20, 22, 28) end
-            btn.BackgroundColor3 = Color3.fromRGB(45, 48, 60)
-            SwitchTab(name)
-        end)
-    end
-
-    CreateTabButton("Finder", "Finder", 0.19, UDim2.new(0, 0, 0, 0))
-    CreateTabButton("Waypoints", "Waypts", 0.19, UDim2.new(0.20, 0, 0, 0))
-    CreateTabButton("Grinding", "Grind", 0.19, UDim2.new(0.40, 0, 0, 0))
-    CreateTabButton("Player", "Player", 0.19, UDim2.new(0.60, 0, 0, 0))
-    CreateTabButton("Settings", "Config", 0.22, UDim2.new(0.80, 0, 0, 0))
-
-    local statsPanel = Instance.new("Frame")
-    statsPanel.Size = UDim2.new(1, -20, 0, 36)
-    statsPanel.Position = UDim2.new(0, 10, 1, -44)
-    statsPanel.BackgroundColor3 = Color3.fromRGB(13, 14, 18)
-    statsPanel.Parent = contentHolder
-    CreateCorner(statsPanel, 6)
-    CreateStroke(statsPanel, Color3.fromRGB(35, 37, 46), 1)
-
-    local statsLabel = Instance.new("TextLabel")
-    statsLabel.Size = UDim2.new(1, -10, 1, 0)
-    statsLabel.Position = UDim2.new(0, 5, 0, 0)
-    statsLabel.BackgroundTransparency = 1
-    statsLabel.TextColor3 = Color3.fromRGB(190, 190, 200)
-    statsLabel.Font = Enum.Font.GothamBold
-    statsLabel.TextSize = 11
-    statsLabel.TextWrapped = true
-    statsLabel.Text = "Crates: 0 | Pails: 0 | Farm: 00:00 | Runtime: 00:00"
-    statsLabel.Parent = statsPanel
-    State.StatsLabelRef = statsLabel
-
-    local finderView = Instance.new("Frame")
-    finderView.Name = "FinderView"
-    finderView.Size = UDim2.new(1, 0, 1, 0)
-    finderView.BackgroundTransparency = 1
-    finderView.Parent = contentFrame
-    State.Views["Finder"] = finderView
-
-    local controlsBar = Instance.new("Frame")
-    controlsBar.Size = UDim2.new(1, 0, 0, 30)
-    controlsBar.BackgroundTransparency = 1
-    controlsBar.Parent = finderView
-
-    local autoFarmToggle = Instance.new("TextButton")
-    autoFarmToggle.Size = UDim2.new(0.48, 0, 1, 0)
-    autoFarmToggle.BackgroundColor3 = CONFIG.Settings.AutoFarmEnabled and Color3.fromRGB(46, 160, 67) or Color3.fromRGB(200, 50, 50)
-    autoFarmToggle.Text = "AUTO-FARM: " .. (CONFIG.Settings.AutoFarmEnabled and "ON" or "OFF")
-    autoFarmToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
-    autoFarmToggle.Font = Enum.Font.GothamBold
-    autoFarmToggle.TextSize = 11
-    autoFarmToggle.Parent = controlsBar
-    CreateCorner(autoFarmToggle, 6)
-
-    autoFarmToggle.MouseButton1Click:Connect(function()
-        CONFIG.Settings.AutoFarmEnabled = not CONFIG.Settings.AutoFarmEnabled
-        autoFarmToggle.BackgroundColor3 = CONFIG.Settings.AutoFarmEnabled and Color3.fromRGB(46, 160, 67) or Color3.fromRGB(200, 50, 50)
-        autoFarmToggle.Text = "AUTO-FARM: " .. (CONFIG.Settings.AutoFarmEnabled and "ON" or "OFF")
-        if CONFIG.Settings.AutoFarmEnabled then
-            State.AutoFarmStartTime = tick()
-        else
-            State.CurrentTrackedTarget = nil
-            State.AutoWalkEnabled = false
-            StopAutoWalk()
-        end
-        ScanForCollectibles()
-        PopulateFinderList()
-    end)
-
-    local filterBtn = Instance.new("TextButton")
-    filterBtn.Size = UDim2.new(0.24, -4, 1, 0)
-    filterBtn.Position = UDim2.new(0.5, 2, 0, 0)
-    filterBtn.BackgroundColor3 = Color3.fromRGB(30, 33, 42)
-    filterBtn.Text = "Filter: All"
-    filterBtn.TextColor3 = Color3.fromRGB(200, 200, 210)
-    filterBtn.Font = Enum.Font.Gotham
-    filterBtn.TextSize = 11
-    filterBtn.Parent = controlsBar
-    CreateCorner(filterBtn, 6)
-
-    filterBtn.MouseButton1Click:Connect(function()
-        if State.CategoryFilter == "All" then State.CategoryFilter = "MysteryCrate"
-        elseif State.CategoryFilter == "MysteryCrate" then State.CategoryFilter = "CandyPail"
-        else State.CategoryFilter = "All" end
-        filterBtn.Text = "Filter: " .. (State.CategoryFilter == "All" and "All" or (State.CategoryFilter == "MysteryCrate" and "Crates" or "Pails"))
-        PopulateFinderList()
-    end)
-
-    local scanBtn = Instance.new("TextButton")
-    scanBtn.Size = UDim2.new(0.24, -2, 1, 0)
-    scanBtn.Position = UDim2.new(0.76, 2, 0, 0)
-    scanBtn.BackgroundColor3 = Color3.fromRGB(31, 111, 235)
-    scanBtn.Text = "Scan"
-    scanBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    scanBtn.Font = Enum.Font.GothamBold
-    scanBtn.TextSize = 11
-    scanBtn.Parent = controlsBar
-    CreateCorner(scanBtn, 6)
-
-    scanBtn.MouseButton1Click:Connect(function()
-        ScanForCollectibles()
-        PopulateFinderList()
-    end)
-
-    local scrollContainer = Instance.new("ScrollingFrame")
-    scrollContainer.Name = "ItemScroll"
-    scrollContainer.Size = UDim2.new(1, 0, 1, -38)
-    scrollContainer.Position = UDim2.new(0, 0, 0, 38)
-    scrollContainer.BackgroundTransparency = 1
-    scrollContainer.ScrollBarThickness = 4
-    scrollContainer.Parent = finderView
-
-    local listLayout = Instance.new("UIListLayout")
-    listLayout.SortOrder = Enum.SortOrder.LayoutOrder
-    listLayout.Padding = UDim.new(0, 6)
-    listLayout.Parent = scrollContainer
-
-    listLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-        scrollContainer.CanvasSize = UDim2.new(0, 0, 0, listLayout.AbsoluteContentSize.Y + 10)
-    end)
-
-    local waypointsView = Instance.new("Frame")
-    waypointsView.Name = "WaypointsView"
-    waypointsView.Size = UDim2.new(1, 0, 1, 0)
-    waypointsView.BackgroundTransparency = 1
-    waypointsView.Visible = false
-    waypointsView.Parent = contentFrame
-    State.Views["Waypoints"] = waypointsView
-
-    local wpInfoLabel = Instance.new("TextLabel")
-    wpInfoLabel.Name = "InfoLabel"
-    wpInfoLabel.Size = UDim2.new(1, 0, 0, 60)
-    wpInfoLabel.Position = UDim2.new(0, 0, 0, 10)
-    wpInfoLabel.BackgroundTransparency = 1
-    wpInfoLabel.Font = Enum.Font.GothamBold
-    wpInfoLabel.TextSize = 13
-    wpInfoLabel.TextColor3 = Color3.fromRGB(220, 220, 230)
-    wpInfoLabel.Text = "No target selected.\nClick Track & Go in Finder or enable Auto-Farm."
-    wpInfoLabel.Parent = waypointsView
-
-    local clearBtn = Instance.new("TextButton")
-    clearBtn.Size = UDim2.new(0.6, 0, 0, 36)
-    clearBtn.Position = UDim2.new(0.2, 0, 0.6, -18)
-    clearBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
-    clearBtn.Text = "Stop Auto-Walking"
-    clearBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    clearBtn.Font = Enum.Font.GothamBold
-    clearBtn.TextSize = 12
-    clearBtn.Parent = waypointsView
-    CreateCorner(clearBtn, 6)
-
-    clearBtn.MouseButton1Click:Connect(function()
-        State.CurrentTrackedTarget = nil
-        State.AutoWalkEnabled = false
-        CONFIG.Settings.AutoFarmEnabled = false
-        autoFarmToggle.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
-        autoFarmToggle.Text = "AUTO-FARM: OFF"
-        StopAutoWalk()
-        wpInfoLabel.Text = "Target cleared.\nClick Track & Go in Finder or enable Auto-Farm."
-    end)
-
-    local grindingView = Instance.new("ScrollingFrame")
-    grindingView.Name = "GrindingView"
-    grindingView.Size = UDim2.new(1, 0, 1, 0)
-    grindingView.BackgroundTransparency = 1
-    grindingView.Visible = false
-    grindingView.CanvasSize = UDim2.new(0, 0, 0, 210)
-    grindingView.ScrollBarThickness = 4
-    grindingView.Parent = contentFrame
-    State.Views["Grinding"] = grindingView
-
-    local function CreateGrindingToggle(parentView, name, yPos, configKey)
-        local lbl = Instance.new("TextLabel")
-        lbl.Size = UDim2.new(0.65, 0, 0, 26)
-        lbl.Position = UDim2.new(0, 0, 0, yPos)
-        lbl.BackgroundTransparency = 1
-        lbl.Text = name
-        lbl.TextColor3 = Color3.fromRGB(220, 220, 230)
-        lbl.Font = Enum.Font.GothamBold
-        lbl.TextSize = 12
-        lbl.TextXAlignment = Enum.TextXAlignment.Left
-        lbl.Parent = parentView
-
-        local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(0, 60, 0, 26)
-        btn.Position = UDim2.new(1, -60, 0, yPos)
-        btn.BackgroundColor3 = CONFIG.Settings[configKey] and Color3.fromRGB(46, 160, 67) or Color3.fromRGB(200, 50, 50)
-        btn.Text = CONFIG.Settings[configKey] and "ON" or "OFF"
-        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-        btn.Font = Enum.Font.GothamBold
-        btn.TextSize = 11
-        btn.Parent = parentView
-        CreateCorner(btn, 6)
-
-        btn.MouseButton1Click:Connect(function()
-            CONFIG.Settings[configKey] = not CONFIG.Settings[configKey]
-            btn.BackgroundColor3 = CONFIG.Settings[configKey] and Color3.fromRGB(46, 160, 67) or Color3.fromRGB(200, 50, 50)
-            btn.Text = CONFIG.Settings[configKey] and "ON" or "OFF"
-        end)
-    end
-
-    CreateGrindingToggle(grindingView, "Auto Rebirth", 5, "AutoRebirthEnabled")
-    CreateGrindingToggle(grindingView, "Auto Spin Wheel", 38, "AutoSpinWheelEnabled")
-
-    local spinLogsBtn = Instance.new("TextButton")
-    spinLogsBtn.Size = UDim2.new(0, 80, 0, 22)
-    spinLogsBtn.Position = UDim2.new(1, -145, 0, 40)
-    spinLogsBtn.BackgroundColor3 = Color3.fromRGB(31, 111, 235)
-    spinLogsBtn.Text = "Show Logs"
-    spinLogsBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    spinLogsBtn.Font = Enum.Font.GothamBold
-    spinLogsBtn.TextSize = 10
-    spinLogsBtn.Parent = grindingView
-    CreateCorner(spinLogsBtn, 4)
-    spinLogsBtn.MouseButton1Click:Connect(function()
-        State.SpinWin.Visible = not State.SpinWin.Visible
-    end)
-
-    CreateGrindingToggle(grindingView, "Auto Claim Quests", 71, "AutoClaimQuestsEnabled")
-    CreateGrindingToggle(grindingView, "Auto Claim Daily", 104, "AutoClaimDailyEnabled")
-    CreateGrindingToggle(grindingView, "Auto Brew Cauldron", 137, "AutoBrewEnabled")
-
-    local brewLogsBtn = Instance.new("TextButton")
-    brewLogsBtn.Size = UDim2.new(0, 80, 0, 22)
-    brewLogsBtn.Position = UDim2.new(1, -145, 0, 139)
-    brewLogsBtn.BackgroundColor3 = Color3.fromRGB(31, 111, 235)
-    brewLogsBtn.Text = "Show Logs"
-    brewLogsBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    brewLogsBtn.Font = Enum.Font.GothamBold
-    brewLogsBtn.TextSize = 10
-    brewLogsBtn.Parent = grindingView
-    CreateCorner(brewLogsBtn, 4)
-    brewLogsBtn.MouseButton1Click:Connect(function()
-        State.BrewWin.Visible = not State.BrewWin.Visible
-    end)
-
-    local playerView = Instance.new("ScrollingFrame")
-    playerView.Name = "PlayerView"
-    playerView.Size = UDim2.new(1, 0, 1, 0)
-    playerView.BackgroundTransparency = 1
-    playerView.Visible = false
-    playerView.CanvasSize = UDim2.new(0, 0, 0, 190)
-    playerView.ScrollBarThickness = 4
-    playerView.Parent = contentFrame
-    State.Views["Player"] = playerView
-
-    CreateGrindingToggle(playerView, "Enable Player ESP (Wallhack)", 5, "PlayerESPEnabled")
-    CreateGrindingToggle(playerView, "Enable Custom Speed (+)", 38, "WalkSpeedEnabled")
-
-    local speedSliderLbl = Instance.new("TextLabel")
-    speedSliderLbl.Size = UDim2.new(1, 0, 0, 18)
-    speedSliderLbl.Position = UDim2.new(0, 0, 0, 68)
-    speedSliderLbl.BackgroundTransparency = 1
-    speedSliderLbl.Text = "Speed Bonus: +" .. CONFIG.Settings.WalkSpeedBonus .. " (0 - 100)"
-    speedSliderLbl.TextColor3 = Color3.fromRGB(170, 170, 180)
-    speedSliderLbl.Font = Enum.Font.Gotham
-    speedSliderLbl.TextSize = 11
-    speedSliderLbl.TextXAlignment = Enum.TextXAlignment.Left
-    speedSliderLbl.Parent = playerView
-
-    local speedBar = Instance.new("Frame")
-    speedBar.Size = UDim2.new(1, 0, 0, 10)
-    speedBar.Position = UDim2.new(0, 0, 0, 88)
-    speedBar.BackgroundColor3 = Color3.fromRGB(30, 33, 42)
-    speedBar.Parent = playerView
-    CreateCorner(speedBar, 5)
-
-    local speedFill = Instance.new("Frame")
-    speedFill.Size = UDim2.new(CONFIG.Settings.WalkSpeedBonus / 100, 0, 1, 0)
-    speedFill.BackgroundColor3 = Color3.fromRGB(31, 111, 235)
-    speedFill.Parent = speedBar
-    CreateCorner(speedFill, 5)
-
-    local speedDragging = false
-    speedBar.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then speedDragging = true end
-    end)
-    UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then speedDragging = false end
-    end)
-    UserInputService.InputChanged:Connect(function(input)
-        if speedDragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-            local posRatio = math.clamp((input.Position.X - speedBar.AbsolutePosition.X) / speedBar.AbsoluteSize.X, 0, 1)
-            speedFill.Size = UDim2.new(posRatio, 0, 1, 0)
-            local calculatedVal = math.round(posRatio * 100)
-            CONFIG.Settings.WalkSpeedBonus = calculatedVal
-            speedSliderLbl.Text = "Speed Bonus: +" .. calculatedVal .. " (0 - 100)"
-        end
-    end)
-
-    local jumpToggleY = 114
-    CreateGrindingToggle(playerView, "Enable Custom Jump (+)", jumpToggleY, "JumpPowerEnabled")
-
-    local jumpSliderLbl = Instance.new("TextLabel")
-    jumpSliderLbl.Size = UDim2.new(1, 0, 0, 18)
-    jumpSliderLbl.Position = UDim2.new(0, 0, 0, jumpToggleY + 31)
-    jumpSliderLbl.BackgroundTransparency = 1
-    jumpSliderLbl.Text = "Jump Bonus: +" .. CONFIG.Settings.JumpPowerBonus .. " (0 - 150)"
-    jumpSliderLbl.TextColor3 = Color3.fromRGB(170, 170, 180)
-    jumpSliderLbl.Font = Enum.Font.Gotham
-    jumpSliderLbl.TextSize = 11
-    jumpSliderLbl.TextXAlignment = Enum.TextXAlignment.Left
-    jumpSliderLbl.Parent = playerView
-
-    local jumpBar = Instance.new("Frame")
-    jumpBar.Size = UDim2.new(1, 0, 0, 10)
-    jumpBar.Position = UDim2.new(0, 0, 0, jumpToggleY + 51)
-    jumpBar.BackgroundColor3 = Color3.fromRGB(30, 33, 42)
-    jumpBar.Parent = playerView
-    CreateCorner(jumpBar, 5)
-
-    local jumpFill = Instance.new("Frame")
-    jumpFill.Size = UDim2.new(CONFIG.Settings.JumpPowerBonus / 150, 0, 1, 0)
-    jumpFill.BackgroundColor3 = Color3.fromRGB(220, 140, 50)
-    jumpFill.Parent = jumpBar
-    CreateCorner(jumpFill, 5)
-
-    local jumpDragging = false
-    jumpBar.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then jumpDragging = true end
-    end)
-    UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then jumpDragging = false end
-    end)
-    UserInputService.InputChanged:Connect(function(input)
-        if jumpDragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-            local posRatio = math.clamp((input.Position.X - jumpBar.AbsolutePosition.X) / jumpBar.AbsoluteSize.X, 0, 1)
-            jumpFill.Size = UDim2.new(posRatio, 0, 1, 0)
-            local calculatedVal = math.round(posRatio * 150)
-            CONFIG.Settings.JumpPowerBonus = calculatedVal
-            jumpSliderLbl.Text = "Jump Bonus: +" .. calculatedVal .. " (0 - 150)"
-        end
-    end)
-
-    local settingsView = Instance.new("ScrollingFrame")
-    settingsView.Name = "SettingsView"
-    settingsView.Size = UDim2.new(1, 0, 1, 0)
-    settingsView.BackgroundTransparency = 1
-    settingsView.Visible = false
-    settingsView.CanvasSize = UDim2.new(0, 0, 0, 220)
-    settingsView.ScrollBarThickness = 4
-    settingsView.Parent = contentFrame
-    State.Views["Settings"] = settingsView
-
-    local function CreateToggleSetting(parentView, name, yPos, configKey)
-        local lbl = Instance.new("TextLabel")
-        lbl.Size = UDim2.new(0.7, 0, 0, 30)
-        lbl.Position = UDim2.new(0, 0, 0, yPos)
-        lbl.BackgroundTransparency = 1
-        lbl.Text = name
-        lbl.TextColor3 = Color3.fromRGB(220, 220, 230)
-        lbl.Font = Enum.Font.Gotham
-        lbl.TextSize = 12
-        lbl.TextXAlignment = Enum.TextXAlignment.Left
-        lbl.Parent = parentView
-
-        local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(0, 60, 0, 26)
-        btn.Position = UDim2.new(1, -60, 0, yPos + 2)
-        btn.BackgroundColor3 = CONFIG.Settings[configKey] and Color3.fromRGB(46, 160, 67) or Color3.fromRGB(200, 50, 50)
-        btn.Text = CONFIG.Settings[configKey] and "ON" or "OFF"
-        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-        btn.Font = Enum.Font.GothamBold
-        btn.TextSize = 11
-        btn.Parent = parentView
-        CreateCorner(btn, 6)
-
-        btn.MouseButton1Click:Connect(function()
-            CONFIG.Settings[configKey] = not CONFIG.Settings[configKey]
-            btn.BackgroundColor3 = CONFIG.Settings[configKey] and Color3.fromRGB(46, 160, 67) or Color3.fromRGB(200, 50, 50)
-            btn.Text = CONFIG.Settings[configKey] and "ON" or "OFF"
-            ScanForCollectibles()
-        end)
-    end
-
-    CreateToggleSetting(settingsView, "Anti-AFK Bypass", 5, "AntiAfkEnabled")
-    CreateToggleSetting(settingsView, "Mod Detector", 42, "ModDetectorEnabled")
-    CreateToggleSetting(settingsView, "Enable Visual Highlighting", 79, "HighlightsEnabled")
-    CreateToggleSetting(settingsView, "Display Floating Text Labels", 116, "DisplayLabels")
-
-    local bindLbl = Instance.new("TextLabel")
-    bindLbl.Size = UDim2.new(0.5, 0, 0, 30)
-    bindLbl.Position = UDim2.new(0, 0, 0, 153)
-    bindLbl.BackgroundTransparency = 1
-    bindLbl.Text = "Toggle Menu Keybind"
-    bindLbl.TextColor3 = Color3.fromRGB(220, 220, 230)
-    bindLbl.Font = Enum.Font.Gotham
-    bindLbl.TextSize = 12
-    bindLbl.TextXAlignment = Enum.TextXAlignment.Left
-    bindLbl.Parent = settingsView
-
-    local bindBtn = Instance.new("TextButton")
-    bindBtn.Size = UDim2.new(0, 100, 0, 26)
-    bindBtn.Position = UDim2.new(1, -100, 0, 155)
-    bindBtn.BackgroundColor3 = Color3.fromRGB(31, 111, 235)
-    bindBtn.Text = tostring(CONFIG.Settings.ToggleKey.Name)
-    bindBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    bindBtn.Font = Enum.Font.GothamBold
-    bindBtn.TextSize = 11
-    bindBtn.Parent = settingsView
-    CreateCorner(bindBtn, 6)
-
-    bindBtn.MouseButton1Click:Connect(function()
-        State.IsListeningForKey = true
-        bindBtn.Text = "Press any key..."
-        local conn
-        conn = UserInputService.InputBegan:Connect(function(input)
-            if input.UserInputType == Enum.UserInputType.Keyboard then
-                CONFIG.Settings.ToggleKey = input.KeyCode
-                bindBtn.Text = tostring(input.KeyCode.Name)
-                State.IsListeningForKey = false
-                conn:Disconnect()
-            end
-        end)
-    end)
-
-    local unloadBtn = Instance.new("TextButton")
-    unloadBtn.Size = UDim2.new(1, 0, 0, 36)
-    unloadBtn.Position = UDim2.new(0, 0, 0, 200)
-    unloadBtn.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
-    unloadBtn.Text = "Completely Unload Script"
-    unloadBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    unloadBtn.Font = Enum.Font.GothamBold
-    unloadBtn.TextSize = 12
-    unloadBtn.Parent = settingsView
-    CreateCorner(unloadBtn, 6)
-
-    local isConfirmingUnload = false
-    unloadBtn.MouseButton1Click:Connect(function()
-        if not isConfirmingUnload then
-            isConfirmingUnload = true
-            unloadBtn.Text = "Click Again to Confirm Unload"
-            unloadBtn.BackgroundColor3 = Color3.fromRGB(255, 0, 0)
-            task.delay(3, function()
-                isConfirmingUnload = false
-                if unloadBtn then
-                    unloadBtn.Text = "Completely Unload Script"
-                    unloadBtn.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
-                end
-            end)
-        else
-            UnloadScript()
-        end
-    end)
-
-    CreateWaypointUI()
-end
-
-PopulateFinderList = function()
-    local finderView = State.Views["Finder"]
-    if not finderView then return end
-
-    local scrollContainer = finderView:FindFirstChild("ItemScroll")
-    if not scrollContainer then return end
-
-    for _, child in ipairs(scrollContainer:GetChildren()) do
-        if child:IsA("Frame") or child:IsA("TextLabel") then child:Destroy() end
-    end
-
-    local filtered = {}
-    for _, item in ipairs(State.DetectedCollectibles) do
-        local matchesCategory = (State.CategoryFilter == "All") or (item.Category == State.CategoryFilter)
-        local matchesSearch = (State.SearchQuery == "") or (string.find(item.Name:lower(), State.SearchQuery:lower(), 1, true) ~= nil)
-        if matchesCategory and matchesSearch then table.insert(filtered, item) end
-    end
-
-    if #filtered == 0 then
-        local emptyText = Instance.new("TextLabel")
-        emptyText.Size = UDim2.new(1, 0, 0, 50)
-        emptyText.BackgroundTransparency = 1
-        emptyText.Text = "No Crates or Candy Pails found.\nItems must spawn in Workspace."
-        emptyText.TextColor3 = Color3.fromRGB(150, 150, 160)
-        emptyText.Font = Enum.Font.Gotham
-        emptyText.TextSize = 12
-        emptyText.Parent = scrollContainer
-        return
-    end
-
-    for _, item in ipairs(filtered) do
-        local row = Instance.new("Frame")
-        row.Size = UDim2.new(1, -6, 0, 36)
-        row.BackgroundColor3 = Color3.fromRGB(26, 28, 36)
-        row.Parent = scrollContainer
-        CreateCorner(row, 6)
-
-        local colorBar = Instance.new("Frame")
-        colorBar.Size = UDim2.new(0, 4, 1, 0)
-        colorBar.BackgroundColor3 = item.Category == "CandyPail" and CONFIG.CandyPail.Color or CONFIG.MysteryCrate.Color
-        colorBar.Parent = row
-        CreateCorner(colorBar, 2)
-
-        local nameLabel = Instance.new("TextLabel")
-        nameLabel.Size = UDim2.new(0.5, -10, 1, 0)
-        nameLabel.Position = UDim2.new(0, 10, 0, 0)
-        nameLabel.BackgroundTransparency = 1
-        nameLabel.Text = item.Name
-        nameLabel.TextColor3 = Color3.fromRGB(230, 230, 240)
-        nameLabel.Font = Enum.Font.GothamBold
-        nameLabel.TextSize = 12
-        nameLabel.TextXAlignment = Enum.TextXAlignment.Left
-        nameLabel.Parent = row
-
-        local distLabel = Instance.new("TextLabel")
-        distLabel.Size = UDim2.new(0.25, 0, 1, 0)
-        distLabel.Position = UDim2.new(0.5, 0, 0, 0)
-        distLabel.BackgroundTransparency = 1
-        distLabel.Text = tostring(item.Distance) .. " studs"
-        distLabel.TextColor3 = Color3.fromRGB(160, 160, 170)
-        distLabel.Font = Enum.Font.Gotham
-        distLabel.TextSize = 11
-        distLabel.Parent = row
-
-        local trackBtn = Instance.new("TextButton")
-        trackBtn.Size = UDim2.new(0.22, -6, 0, 24)
-        trackBtn.Position = UDim2.new(0.78, 0, 0.5, -12)
-        trackBtn.BackgroundColor3 = (State.CurrentTrackedTarget == item.Instance) and Color3.fromRGB(46, 160, 67) or Color3.fromRGB(45, 48, 60)
-        trackBtn.Text = (State.CurrentTrackedTarget == item.Instance) and "Walking..." or "Track & Go"
-        trackBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-        trackBtn.Font = Enum.Font.GothamBold
-        trackBtn.TextSize = 10
-        trackBtn.Parent = row
-        CreateCorner(trackBtn, 5)
-
-        trackBtn.MouseButton1Click:Connect(function()
-            if State.CurrentTrackedTarget == item.Instance then
-                State.CurrentTrackedTarget = nil
-                State.AutoWalkEnabled = false
-                StopAutoWalk()
-            else
-                State.CurrentTrackedTarget = item.Instance
-                State.AutoWalkEnabled = true
-            end
-            PopulateFinderList()
-        end)
-    end
-end
-
-local function Initialize()
-    BuildGUI()
-    SetupAntiAfk()
-    SetupModDetector()
-    ScanForCollectibles()
-    PopulateFinderList()
-
-    local lastScan = 0
-    local renderConn = RunService.RenderStepped:Connect(function(dt)
-        lastScan = lastScan + dt
-        if CONFIG.Settings.AutoRefresh and lastScan >= CONFIG.Settings.RefreshInterval then
-            lastScan = 0
-            ScanForCollectibles()
-            if State.ActiveTab == "Finder" then PopulateFinderList() end
-        end
-
-        UpdateWaypointTracking()
-        StepAutoWalk()
-        StepAntiAfk(dt)
-        ApplyPlayerModifications()
-        UpdatePlayerESP()
-
-        if State.StatsLabelRef then
-            local scriptRuntime = math.floor(tick() - State.ScriptStartTime)
-            local autoFarmTime = 0
-            if CONFIG.Settings.AutoFarmEnabled then
-                autoFarmTime = math.floor(tick() - State.AutoFarmStartTime)
-            end
-
-            State.StatsLabelRef.Text = string.format(
-                "Crates: %d | Pails: %d | Farm: %s | Runtime: %s",
-                State.CratesClaimed,
-                State.PailsClaimed,
-                FormatTime(autoFarmTime),
-                FormatTime(scriptRuntime)
-            )
-        end
-    end)
-    table.insert(State.Connections, renderConn)
-
-    local charConn = LocalPlayer.CharacterAdded:Connect(function()
-        task.wait(1)
-        State.HasCapturedOriginals = false
-        ScanForCollectibles()
-        if State.ActiveTab == "Finder" then PopulateFinderList() end
-    end)
-    table.insert(State.Connections, charConn)
-end
-
-Initialize()
+                    GNU AFFERO GENERAL PUBLIC LICENSE
+                       Version 3, 19 November 2007
+
+ Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>
+ Everyone is permitted to copy and distribute verbatim copies
+ of this license document, but changing it is not allowed.
+
+                            Preamble
+
+  The GNU Affero General Public License is a free, copyleft license for
+software and other kinds of works, specifically designed to ensure
+cooperation with the community in the case of network server software.
+
+  The licenses for most software and other practical works are designed
+to take away your freedom to share and change the works.  By contrast,
+our General Public Licenses are intended to guarantee your freedom to
+share and change all versions of a program--to make sure it remains free
+software for all its users.
+
+  When we speak of free software, we are referring to freedom, not
+price.  Our General Public Licenses are designed to make sure that you
+have the freedom to distribute copies of free software (and charge for
+them if you wish), that you receive source code or can get it if you
+want it, that you can change the software or use pieces of it in new
+free programs, and that you know you can do these things.
+
+  Developers that use our General Public Licenses protect your rights
+with two steps: (1) assert copyright on the software, and (2) offer
+you this License which gives you legal permission to copy, distribute
+and/or modify the software.
+
+  A secondary benefit of defending all users' freedom is that
+improvements made in alternate versions of the program, if they
+receive widespread use, become available for other developers to
+incorporate.  Many developers of free software are heartened and
+encouraged by the resulting cooperation.  However, in the case of
+software used on network servers, this result may fail to come about.
+The GNU General Public License permits making a modified version and
+letting the public access it on a server without ever releasing its
+source code to the public.
+
+  The GNU Affero General Public License is designed specifically to
+ensure that, in such cases, the modified source code becomes available
+to the community.  It requires the operator of a network server to
+provide the source code of the modified version running there to the
+users of that server.  Therefore, public use of a modified version, on
+a publicly accessible server, gives the public access to the source
+code of the modified version.
+
+  An older license, called the Affero General Public License and
+published by Affero, was designed to accomplish similar goals.  This is
+a different license, not a version of the Affero GPL, but Affero has
+released a new version of the Affero GPL which permits relicensing under
+this license.
+
+  The precise terms and conditions for copying, distribution and
+modification follow.
+
+                       TERMS AND CONDITIONS
+
+  0. Definitions.
+
+  "This License" refers to version 3 of the GNU Affero General Public License.
+
+  "Copyright" also means copyright-like laws that apply to other kinds of
+works, such as semiconductor masks.
+
+  "The Program" refers to any copyrightable work licensed under this
+License.  Each licensee is addressed as "you".  "Licensees" and
+"recipients" may be individuals or organizations.
+
+  To "modify" a work means to copy from or adapt all or part of the work
+in a fashion requiring copyright permission, other than the making of an
+exact copy.  The resulting work is called a "modified version" of the
+earlier work or a work "based on" the earlier work.
+
+  A "covered work" means either the unmodified Program or a work based
+on the Program.
+
+  To "propagate" a work means to do anything with it that, without
+permission, would make you directly or secondarily liable for
+infringement under applicable copyright law, except executing it on a
+computer or modifying a private copy.  Propagation includes copying,
+distribution (with or without modification), making available to the
+public, and in some countries other activities as well.
+
+  To "convey" a work means any kind of propagation that enables other
+parties to make or receive copies.  Mere interaction with a user through
+a computer network, with no transfer of a copy, is not conveying.
+
+  An interactive user interface displays "Appropriate Legal Notices"
+to the extent that it includes a convenient and prominently visible
+feature that (1) displays an appropriate copyright notice, and (2)
+tells the user that there is no warranty for the work (except to the
+extent that warranties are provided), that licensees may convey the
+work under this License, and how to view a copy of this License.  If
+the interface presents a list of user commands or options, such as a
+menu, a prominent item in the list meets this criterion.
+
+  1. Source Code.
+
+  The "source code" for a work means the preferred form of the work
+for making modifications to it.  "Object code" means any non-source
+form of a work.
+
+  A "Standard Interface" means an interface that either is an official
+standard defined by a recognized standards body, or, in the case of
+interfaces specified for a particular programming language, one that
+is widely used among developers working in that language.
+
+  The "System Libraries" of an executable work include anything, other
+than the work as a whole, that (a) is included in the normal form of
+packaging a Major Component, but which is not part of that Major
+Component, and (b) serves only to enable use of the work with that
+Major Component, or to implement a Standard Interface for which an
+implementation is available to the public in source code form.  A
+"Major Component", in this context, means a major essential component
+(kernel, window system, and so on) of the specific operating system
+(if any) on which the executable work runs, or a compiler used to
+produce the work, or an object code interpreter used to run it.
+
+  The "Corresponding Source" for a work in object code form means all
+the source code needed to generate, install, and (for an executable
+work) run the object code and to modify the work, including scripts to
+control those activities.  However, it does not include the work's
+System Libraries, or general-purpose tools or generally available free
+programs which are used unmodified in performing those activities but
+which are not part of the work.  For example, Corresponding Source
+includes interface definition files associated with source files for
+the work, and the source code for shared libraries and dynamically
+linked subprograms that the work is specifically designed to require,
+such as by intimate data communication or control flow between those
+subprograms and other parts of the work.
+
+  The Corresponding Source need not include anything that users
+can regenerate automatically from other parts of the Corresponding
+Source.
+
+  The Corresponding Source for a work in source code form is that
+same work.
+
+  2. Basic Permissions.
+
+  All rights granted under this License are granted for the term of
+copyright on the Program, and are irrevocable provided the stated
+conditions are met.  This License explicitly affirms your unlimited
+permission to run the unmodified Program.  The output from running a
+covered work is covered by this License only if the output, given its
+content, constitutes a covered work.  This License acknowledges your
+rights of fair use or other equivalent, as provided by copyright law.
+
+  You may make, run and propagate covered works that you do not
+convey, without conditions so long as your license otherwise remains
+in force.  You may convey covered works to others for the sole purpose
+of having them make modifications exclusively for you, or provide you
+with facilities for running those works, provided that you comply with
+the terms of this License in conveying all material for which you do
+not control copyright.  Those thus making or running the covered works
+for you must do so exclusively on your behalf, under your direction
+and control, on terms that prohibit them from making any copies of
+your copyrighted material outside their relationship with you.
+
+  Conveying under any other circumstances is permitted solely under
+the conditions stated below.  Sublicensing is not allowed; section 10
+makes it unnecessary.
+
+  3. Protecting Users' Legal Rights From Anti-Circumvention Law.
+
+  No covered work shall be deemed part of an effective technological
+measure under any applicable law fulfilling obligations under article
+11 of the WIPO copyright treaty adopted on 20 December 1996, or
+similar laws prohibiting or restricting circumvention of such
+measures.
+
+  When you convey a covered work, you waive any legal power to forbid
+circumvention of technological measures to the extent such circumvention
+is effected by exercising rights under this License with respect to
+the covered work, and you disclaim any intention to limit operation or
+modification of the work as a means of enforcing, against the work's
+users, your or third parties' legal rights to forbid circumvention of
+technological measures.
+
+  4. Conveying Verbatim Copies.
+
+  You may convey verbatim copies of the Program's source code as you
+receive it, in any medium, provided that you conspicuously and
+appropriately publish on each copy an appropriate copyright notice;
+keep intact all notices stating that this License and any
+non-permissive terms added in accord with section 7 apply to the code;
+keep intact all notices of the absence of any warranty; and give all
+recipients a copy of this License along with the Program.
+
+  You may charge any price or no price for each copy that you convey,
+and you may offer support or warranty protection for a fee.
+
+  5. Conveying Modified Source Versions.
+
+  You may convey a work based on the Program, or the modifications to
+produce it from the Program, in the form of source code under the
+terms of section 4, provided that you also meet all of these conditions:
+
+    a) The work must carry prominent notices stating that you modified
+    it, and giving a relevant date.
+
+    b) The work must carry prominent notices stating that it is
+    released under this License and any conditions added under section
+    7.  This requirement modifies the requirement in section 4 to
+    "keep intact all notices".
+
+    c) You must license the entire work, as a whole, under this
+    License to anyone who comes into possession of a copy.  This
+    License will therefore apply, along with any applicable section 7
+    additional terms, to the whole of the work, and all its parts,
+    regardless of how they are packaged.  This License gives no
+    permission to license the work in any other way, but it does not
+    invalidate such permission if you have separately received it.
+
+    d) If the work has interactive user interfaces, each must display
+    Appropriate Legal Notices; however, if the Program has interactive
+    interfaces that do not display Appropriate Legal Notices, your
+    work need not make them do so.
+
+  A compilation of a covered work with other separate and independent
+works, which are not by their nature extensions of the covered work,
+and which are not combined with it such as to form a larger program,
+in or on a volume of a storage or distribution medium, is called an
+"aggregate" if the compilation and its resulting copyright are not
+used to limit the access or legal rights of the compilation's users
+beyond what the individual works permit.  Inclusion of a covered work
+in an aggregate does not cause this License to apply to the other
+parts of the aggregate.
+
+  6. Conveying Non-Source Forms.
+
+  You may convey a covered work in object code form under the terms
+of sections 4 and 5, provided that you also convey the
+machine-readable Corresponding Source under the terms of this License,
+in one of these ways:
+
+    a) Convey the object code in, or embodied in, a physical product
+    (including a physical distribution medium), accompanied by the
+    Corresponding Source fixed on a durable physical medium
+    customarily used for software interchange.
+
+    b) Convey the object code in, or embodied in, a physical product
+    (including a physical distribution medium), accompanied by a
+    written offer, valid for at least three years and valid for as
+    long as you offer spare parts or customer support for that product
+    model, to give anyone who possesses the object code either (1) a
+    copy of the Corresponding Source for all the software in the
+    product that is covered by this License, on a durable physical
+    medium customarily used for software interchange, for a price no
+    more than your reasonable cost of physically performing this
+    conveying of source, or (2) access to copy the
+    Corresponding Source from a network server at no charge.
+
+    c) Convey individual copies of the object code with a copy of the
+    written offer to provide the Corresponding Source.  This
+    alternative is allowed only occasionally and noncommercially, and
+    only if you received the object code with such an offer, in accord
+    with subsection 6b.
+
+    d) Convey the object code by offering access from a designated
+    place (gratis or for a charge), and offer equivalent access to the
+    Corresponding Source in the same way through the same place at no
+    further charge.  You need not require recipients to copy the
+    Corresponding Source along with the object code.  If the place to
+    copy the object code is a network server, the Corresponding Source
+    may be on a different server (operated by you or a third party)
+    that supports equivalent copying facilities, provided you maintain
+    clear directions next to the object code saying where to find the
+    Corresponding Source.  Regardless of what server hosts the
+    Corresponding Source, you remain obligated to ensure that it is
+    available for as long as needed to satisfy these requirements.
+
+    e) Convey the object code using peer-to-peer transmission, provided
+    you inform other peers where the object code and Corresponding
+    Source of the work are being offered to the general public at no
+    charge under subsection 6d.
+
+  A separable portion of the object code, whose source code is excluded
+from the Corresponding Source as a System Library, need not be
+included in conveying the object code work.
+
+  A "User Product" is either (1) a "consumer product", which means any
+tangible personal property which is normally used for personal, family,
+or household purposes, or (2) anything designed or sold for incorporation
+into a dwelling.  In determining whether a product is a consumer product,
+doubtful cases shall be resolved in favor of coverage.  For a particular
+product received by a particular user, "normally used" refers to a
+typical or common use of that class of product, regardless of the status
+of the particular user or of the way in which the particular user
+actually uses, or expects or is expected to use, the product.  A product
+is a consumer product regardless of whether the product has substantial
+commercial, industrial or non-consumer uses, unless such uses represent
+the only significant mode of use of the product.
+
+  "Installation Information" for a User Product means any methods,
+procedures, authorization keys, or other information required to install
+and execute modified versions of a covered work in that User Product from
+a modified version of its Corresponding Source.  The information must
+suffice to ensure that the continued functioning of the modified object
+code is in no case prevented or interfered with solely because
+modification has been made.
+
+  If you convey an object code work under this section in, or with, or
+specifically for use in, a User Product, and the conveying occurs as
+part of a transaction in which the right of possession and use of the
+User Product is transferred to the recipient in perpetuity or for a
+fixed term (regardless of how the transaction is characterized), the
+Corresponding Source conveyed under this section must be accompanied
+by the Installation Information.  But this requirement does not apply
+if neither you nor any third party retains the ability to install
+modified object code on the User Product (for example, the work has
+been installed in ROM).
+
+  The requirement to provide Installation Information does not include a
+requirement to continue to provide support service, warranty, or updates
+for a work that has been modified or installed by the recipient, or for
+the User Product in which it has been modified or installed.  Access to a
+network may be denied when the modification itself materially and
+adversely affects the operation of the network or violates the rules and
+protocols for communication across the network.
+
+  Corresponding Source conveyed, and Installation Information provided,
+in accord with this section must be in a format that is publicly
+documented (and with an implementation available to the public in
+source code form), and must require no special password or key for
+unpacking, reading or copying.
+
+  7. Additional Terms.
+
+  "Additional permissions" are terms that supplement the terms of this
+License by making exceptions from one or more of its conditions.
+Additional permissions that are applicable to the entire Program shall
+be treated as though they were included in this License, to the extent
+that they are valid under applicable law.  If additional permissions
+apply only to part of the Program, that part may be used separately
+under those permissions, but the entire Program remains governed by
+this License without regard to the additional permissions.
+
+  When you convey a copy of a covered work, you may at your option
+remove any additional permissions from that copy, or from any part of
+it.  (Additional permissions may be written to require their own
+removal in certain cases when you modify the work.)  You may place
+additional permissions on material, added by you to a covered work,
+for which you have or can give appropriate copyright permission.
+
+  Notwithstanding any other provision of this License, for material you
+add to a covered work, you may (if authorized by the copyright holders of
+that material) supplement the terms of this License with terms:
+
+    a) Disclaiming warranty or limiting liability differently from the
+    terms of sections 15 and 16 of this License; or
+
+    b) Requiring preservation of specified reasonable legal notices or
+    author attributions in that material or in the Appropriate Legal
+    Notices displayed by works containing it; or
+
+    c) Prohibiting misrepresentation of the origin of that material, or
+    requiring that modified versions of such material be marked in
+    reasonable ways as different from the original version; or
+
+    d) Limiting the use for publicity purposes of names of licensors or
+    authors of the material; or
+
+    e) Declining to grant rights under trademark law for use of some
+    trade names, trademarks, or service marks; or
+
+    f) Requiring indemnification of licensors and authors of that
+    material by anyone who conveys the material (or modified versions of
+    it) with contractual assumptions of liability to the recipient, for
+    any liability that these contractual assumptions directly impose on
+    those licensors and authors.
+
+  All other non-permissive additional terms are considered "further
+restrictions" within the meaning of section 10.  If the Program as you
+received it, or any part of it, contains a notice stating that it is
+governed by this License along with a term that is a further
+restriction, you may remove that term.  If a license document contains
+a further restriction but permits relicensing or conveying under this
+License, you may add to a covered work material governed by the terms
+of that license document, provided that the further restriction does
+not survive such relicensing or conveying.
+
+  If you add terms to a covered work in accord with this section, you
+must place, in the relevant source files, a statement of the
+additional terms that apply to those files, or a notice indicating
+where to find the applicable terms.
+
+  Additional terms, permissive or non-permissive, may be stated in the
+form of a separately written license, or stated as exceptions;
+the above requirements apply either way.
+
+  8. Termination.
+
+  You may not propagate or modify a covered work except as expressly
+provided under this License.  Any attempt otherwise to propagate or
+modify it is void, and will automatically terminate your rights under
+this License (including any patent licenses granted under the third
+paragraph of section 11).
+
+  However, if you cease all violation of this License, then your
+license from a particular copyright holder is reinstated (a)
+provisionally, unless and until the copyright holder explicitly and
+finally terminates your license, and (b) permanently, if the copyright
+holder fails to notify you of the violation by some reasonable means
+prior to 60 days after the cessation.
+
+  Moreover, your license from a particular copyright holder is
+reinstated permanently if the copyright holder notifies you of the
+violation by some reasonable means, this is the first time you have
+received notice of violation of this License (for any work) from that
+copyright holder, and you cure the violation prior to 30 days after
+your receipt of the notice.
+
+  Termination of your rights under this section does not terminate the
+licenses of parties who have received copies or rights from you under
+this License.  If your rights have been terminated and not permanently
+reinstated, you do not qualify to receive new licenses for the same
+material under section 10.
+
+  9. Acceptance Not Required for Having Copies.
+
+  You are not required to accept this License in order to receive or
+run a copy of the Program.  Ancillary propagation of a covered work
+occurring solely as a consequence of using peer-to-peer transmission
+to receive a copy likewise does not require acceptance.  However,
+nothing other than this License grants you permission to propagate or
+modify any covered work.  These actions infringe copyright if you do
+not accept this License.  Therefore, by modifying or propagating a
+covered work, you indicate your acceptance of this License to do so.
+
+  10. Automatic Licensing of Downstream Recipients.
+
+  Each time you convey a covered work, the recipient automatically
+receives a license from the original licensors, to run, modify and
+propagate that work, subject to this License.  You are not responsible
+for enforcing compliance by third parties with this License.
+
+  An "entity transaction" is a transaction transferring control of an
+organization, or substantially all assets of one, or subdividing an
+organization, or merging organizations.  If propagation of a covered
+work results from an entity transaction, each party to that
+transaction who receives a copy of the work also receives whatever
+licenses to the work the party's predecessor in interest had or could
+give under the previous paragraph, plus a right to possession of the
+Corresponding Source of the work from the predecessor in interest, if
+the predecessor has it or can get it with reasonable efforts.
+
+  You may not impose any further restrictions on the exercise of the
+rights granted or affirmed under this License.  For example, you may
+not impose a license fee, royalty, or other charge for exercise of
+rights granted under this License, and you may not initiate litigation
+(including a cross-claim or counterclaim in a lawsuit) alleging that
+any patent claim is infringed by making, using, selling, offering for
+sale, or importing the Program or any portion of it.
+
+  11. Patents.
+
+  A "contributor" is a copyright holder who authorizes use under this
+License of the Program or a work on which the Program is based.  The
+work thus licensed is called the contributor's "contributor version".
+
+  A contributor's "essential patent claims" are all patent claims
+owned or controlled by the contributor, whether already acquired or
+hereafter acquired, that would be infringed by some manner, permitted
+by this License, of making, using, or selling its contributor version,
+but do not include claims that would be infringed only as a
+consequence of further modification of the contributor version.  For
+purposes of this definition, "control" includes the right to grant
+patent sublicenses in a manner consistent with the requirements of
+this License.
+
+  Each contributor grants you a non-exclusive, worldwide, royalty-free
+patent license under the contributor's essential patent claims, to
+make, use, sell, offer for sale, import and otherwise run, modify and
+propagate the contents of its contributor version.
+
+  In the following three paragraphs, a "patent license" is any express
+agreement or commitment, however denominated, not to enforce a patent
+(such as an express permission to practice a patent or covenant not to
+sue for patent infringement).  To "grant" such a patent license to a
+party means to make such an agreement or commitment not to enforce a
+patent against the party.
+
+  If you convey a covered work, knowingly relying on a patent license,
+and the Corresponding Source of the work is not available for anyone
+to copy, free of charge and under the terms of this License, through a
+publicly available network server or other readily accessible means,
+then you must either (1) cause the Corresponding Source to be so
+available, or (2) arrange to deprive yourself of the benefit of the
+patent license for this particular work, or (3) arrange, in a manner
+consistent with the requirements of this License, to extend the patent
+license to downstream recipients.  "Knowingly relying" means you have
+actual knowledge that, but for the patent license, your conveying the
+covered work in a country, or your recipient's use of the covered work
+in a country, would infringe one or more identifiable patents in that
+country that you have reason to believe are valid.
+
+  If, pursuant to or in connection with a single transaction or
+arrangement, you convey, or propagate by procuring conveyance of, a
+covered work, and grant a patent license to some of the parties
+receiving the covered work authorizing them to use, propagate, modify
+or convey a specific copy of the covered work, then the patent license
+you grant is automatically extended to all recipients of the covered
+work and works based on it.
+
+  A patent license is "discriminatory" if it does not include within
+the scope of its coverage, prohibits the exercise of, or is
+conditioned on the non-exercise of one or more of the rights that are
+specifically granted under this License.  You may not convey a covered
+work if you are a party to an arrangement with a third party that is
+in the business of distributing software, under which you make payment
+to the third party based on the extent of your activity of conveying
+the work, and under which the third party grants, to any of the
+parties who would receive the covered work from you, a discriminatory
+patent license (a) in connection with copies of the covered work
+conveyed by you (or copies made from those copies), or (b) primarily
+for and in connection with specific products or compilations that
+contain the covered work, unless you entered into that arrangement,
+or that patent license was granted, prior to 28 March 2007.
+
+  Nothing in this License shall be construed as excluding or limiting
+any implied license or other defenses to infringement that may
+otherwise be available to you under applicable patent law.
+
+  12. No Surrender of Others' Freedom.
+
+  If conditions are imposed on you (whether by court order, agreement or
+otherwise) that contradict the conditions of this License, they do not
+excuse you from the conditions of this License.  If you cannot convey a
+covered work so as to satisfy simultaneously your obligations under this
+License and any other pertinent obligations, then as a consequence you may
+not convey it at all.  For example, if you agree to terms that obligate you
+to collect a royalty for further conveying from those to whom you convey
+the Program, the only way you could satisfy both those terms and this
+License would be to refrain entirely from conveying the Program.
+
+  13. Remote Network Interaction; Use with the GNU General Public License.
+
+  Notwithstanding any other provision of this License, if you modify the
+Program, your modified version must prominently offer all users
+interacting with it remotely through a computer network (if your version
+supports such interaction) an opportunity to receive the Corresponding
+Source of your version by providing access to the Corresponding Source
+from a network server at no charge, through some standard or customary
+means of facilitating copying of software.  This Corresponding Source
+shall include the Corresponding Source for any work covered by version 3
+of the GNU General Public License that is incorporated pursuant to the
+following paragraph.
+
+  Notwithstanding any other provision of this License, you have
+permission to link or combine any covered work with a work licensed
+under version 3 of the GNU General Public License into a single
+combined work, and to convey the resulting work.  The terms of this
+License will continue to apply to the part which is the covered work,
+but the work with which it is combined will remain governed by version
+3 of the GNU General Public License.
+
+  14. Revised Versions of this License.
+
+  The Free Software Foundation may publish revised and/or new versions of
+the GNU Affero General Public License from time to time.  Such new versions
+will be similar in spirit to the present version, but may differ in detail to
+address new problems or concerns.
+
+  Each version is given a distinguishing version number.  If the
+Program specifies that a certain numbered version of the GNU Affero General
+Public License "or any later version" applies to it, you have the
+option of following the terms and conditions either of that numbered
+version or of any later version published by the Free Software
+Foundation.  If the Program does not specify a version number of the
+GNU Affero General Public License, you may choose any version ever published
+by the Free Software Foundation.
+
+  If the Program specifies that a proxy can decide which future
+versions of the GNU Affero General Public License can be used, that proxy's
+public statement of acceptance of a version permanently authorizes you
+to choose that version for the Program.
+
+  Later license versions may give you additional or different
+permissions.  However, no additional obligations are imposed on any
+author or copyright holder as a result of your choosing to follow a
+later version.
+
+  15. Disclaimer of Warranty.
+
+  THERE IS NO WARRANTY FOR THE PROGRAM, TO THE EXTENT PERMITTED BY
+APPLICABLE LAW.  EXCEPT WHEN OTHERWISE STATED IN WRITING THE COPYRIGHT
+HOLDERS AND/OR OTHER PARTIES PROVIDE THE PROGRAM "AS IS" WITHOUT WARRANTY
+OF ANY KIND, EITHER EXPRESSED OR IMPLIED, INCLUDING, BUT NOT LIMITED TO,
+THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+PURPOSE.  THE ENTIRE RISK AS TO THE QUALITY AND PERFORMANCE OF THE PROGRAM
+IS WITH YOU.  SHOULD THE PROGRAM PROVE DEFECTIVE, YOU ASSUME THE COST OF
+ALL NECESSARY SERVICING, REPAIR OR CORRECTION.
+
+  16. Limitation of Liability.
+
+  IN NO EVENT UNLESS REQUIRED BY APPLICABLE LAW OR AGREED TO IN WRITING
+WILL ANY COPYRIGHT HOLDER, OR ANY OTHER PARTY WHO MODIFIES AND/OR CONVEYS
+THE PROGRAM AS PERMITTED ABOVE, BE LIABLE TO YOU FOR DAMAGES, INCLUDING ANY
+GENERAL, SPECIAL, INCIDENTAL OR CONSEQUENTIAL DAMAGES ARISING OUT OF THE
+USE OR INABILITY TO USE THE PROGRAM (INCLUDING BUT NOT LIMITED TO LOSS OF
+DATA OR DATA BEING RENDERED INACCURATE OR LOSSES SUSTAINED BY YOU OR THIRD
+PARTIES OR A FAILURE OF THE PROGRAM TO OPERATE WITH ANY OTHER PROGRAMS),
+EVEN IF SUCH HOLDER OR OTHER PARTY HAS BEEN ADVISED OF THE POSSIBILITY OF
+SUCH DAMAGES.
+
+  17. Interpretation of Sections 15 and 16.
+
+  If the disclaimer of warranty and limitation of liability provided
+above cannot be given local legal effect according to their terms,
+reviewing courts shall apply local law that most closely approximates
+an absolute waiver of all civil liability in connection with the
+Program, unless a warranty or assumption of liability accompanies a
+copy of the Program in return for a fee.
+
+                     END OF TERMS AND CONDITIONS
+
+            How to Apply These Terms to Your New Programs
+
+  If you develop a new program, and you want it to be of the greatest
+possible use to the public, the best way to achieve this is to make it
+free software which everyone can redistribute and change under these terms.
+
+  To do so, attach the following notices to the program.  It is safest
+to attach them to the start of each source file to most effectively
+state the exclusion of warranty; and each file should have at least
+the "copyright" line and a pointer to where the full notice is found.
+
+    <one line to give the program's name and a brief idea of what it does.>
+    Copyright (C) <year>  <name of author>
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU Affero General Public License as published
+    by the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU Affero General Public License for more details.
+
+    You should have received a copy of the GNU Affero General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+Also add information on how to contact you by electronic and paper mail.
+
+  If your software can interact with users remotely through a computer
+network, you should also make sure that it provides a way for users to
+get its source.  For example, if your program is a web application, its
+interface could display a "Source" link that leads users to an archive
+of the code.  There are many ways you could offer source, and different
+solutions will be better for different programs; see section 13 for the
+specific requirements.
+
+  You should also get your employer (if you work as a programmer) or school,
+if any, to sign a "copyright disclaimer" for the program, if necessary.
+For more information on this, and how to apply and follow the GNU AGPL, see
+<https://www.gnu.org/licenses/>.
