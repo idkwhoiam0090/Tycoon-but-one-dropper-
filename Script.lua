@@ -32,6 +32,20 @@ local CONFIG = {
         Color = Color3.fromRGB(255, 85, 255),
         FolderNames = {"CandyPails", "Pails", "EventCollectibles", "Candy"}
     },
+    LightningDrop = {
+        CategoryName = "Lightning Surge",
+        Names = {"Lightning", "Energy", "Surge", "Volt", "Spark"},
+        Tags = {"LightningDrop", "EnergyDrop"},
+        Color = Color3.fromRGB(0, 255, 255),
+        FolderNames = {"LightningDrops", "EventCollectibles", "Spawns", "Debris", "Workspace"}
+    },
+    AirDrop = {
+        CategoryName = "Airdrops",
+        Names = {"Airdrop", "SupplyDrop", "CarePackage", "DropCrate"},
+        Tags = {"AirdropTag", "SupplyDrop"},
+        Color = Color3.fromRGB(255, 50, 50),
+        FolderNames = {"Airdrops", "Drops", "EventCollectibles", "Spawns", "Debris", "Workspace"}
+    },
     Settings = {
         HighlightsEnabled = true,
         DisplayLabels = true,
@@ -72,6 +86,8 @@ local State = {
     HasCapturedOriginals = false,
     CratesClaimed = 0,
     PailsClaimed = 0,
+    LightningClaimed = 0,
+    AirdropsClaimed = 0,
     ScriptStartTime = tick(),
     AutoFarmStartTime = 0,
     PreviousTargetInstance = nil,
@@ -246,37 +262,61 @@ task.spawn(function()
     end
 end)
 
--- 3. Auto Claim Daily
+-- 3. Auto Claim Daily (Multi-Endpoint Support)
 task.spawn(function()
     while true do
-        task.wait(6.0)
+        task.wait(15.0)
         if not State.GuiInstance then break end
         if CONFIG.Settings.AutoClaimDailyEnabled then
             pcall(function()
-                local res = SafeInvoke("ClaimDaily") or SafeInvoke("Daily", "Claim")
-                if res and type(res) == "table" and res.ok then
-                    AddLogEntry("Spin", "Daily: Claimed Daily Reward!")
+                local dailyAttempts = {
+                    {"ClaimDaily"},
+                    {"Daily", "Claim"},
+                    {"DailyReward", "Claim"},
+                    {"Rewards", "ClaimDaily"},
+                    {"Quests", "Claim", "Daily"}
+                }
+                for _, args in ipairs(dailyAttempts) do
+                    if not CONFIG.Settings.AutoClaimDailyEnabled then break end
+                    local res = SafeInvoke(unpack(args))
+                    if res and type(res) == "table" and res.ok then
+                        AddLogEntry("Spin", "Daily Reward Claimed!")
+                        break
+                    end
+                    task.wait(1.5)
                 end
             end)
         end
     end
 end)
 
--- 4. Auto Claim Quests (Throttled with 1.2s delay to avoid "slow down" error)
+-- 4. Auto Claim Quests (Strict Rate-Limiting & Deep Category Sweeping)
 task.spawn(function()
+    local questCategories = {"Daily", "Weekly", "Ach"}
+    local questIds = {1, 2, 3, 4, 5, 6, 7, 8, "dGold", "dPlay", "dMystery", "wGold", "wPlay", "wMystery"}
+    
     while true do
-        task.wait(5.0)
+        task.wait(10.0)
         if not State.GuiInstance then break end
         if CONFIG.Settings.AutoClaimQuestsEnabled then
             pcall(function()
-                local questIds = {1, 2, 3, 4, 5, "dGold", "dPlay", "dMystery", "wGold", "wPlay", "wMystery"}
                 for _, id in ipairs(questIds) do
                     if not CONFIG.Settings.AutoClaimQuestsEnabled then break end
-                    local res = SafeInvoke("Quests", "Claim", id)
-                    if res and type(res) == "table" and res.ok then
-                        AddLogEntry("Spin", "Claimed Quest ID: " .. tostring(id))
+                    
+                    local res1 = SafeInvoke("Quests", "Claim", id)
+                    if res1 and type(res1) == "table" and res1.ok then
+                        AddLogEntry("Spin", "Claimed Quest: " .. tostring(id))
                     end
-                    task.wait(1.2)
+                    task.wait(1.5) 
+                    
+                    for _, category in ipairs(questCategories) do
+                        if not CONFIG.Settings.AutoClaimQuestsEnabled then break end
+                        local res2 = SafeInvoke("Quests", "Claim", category, id)
+                        if res2 and type(res2) == "table" and res2.ok then
+                            AddLogEntry("Spin", "Claimed " .. category .. " Quest: " .. tostring(id))
+                        end
+                        task.wait(1.5)
+                    end
                 end
             end)
         end
@@ -625,7 +665,12 @@ local function ApplyHighlight(itemData)
     if State.Highlights[inst] then return end
     if not CONFIG.Settings.HighlightsEnabled then return end
 
-    local color = itemData.Category == "CandyPail" and CONFIG.CandyPail.Color or CONFIG.MysteryCrate.Color
+    local color = Color3.new(1,1,1)
+    if itemData.Category == "CandyPail" then color = CONFIG.CandyPail.Color
+    elseif itemData.Category == "MysteryCrate" then color = CONFIG.MysteryCrate.Color
+    elseif itemData.Category == "LightningDrop" then color = CONFIG.LightningDrop.Color
+    elseif itemData.Category == "AirDrop" then color = CONFIG.AirDrop.Color
+    end
 
     local hl = Instance.new("Highlight")
     hl.Name = "CollectibleHighlight"
@@ -689,6 +734,10 @@ local function ScanForCollectibles()
             State.CratesClaimed = State.CratesClaimed + 1
         elseif State.PreviousTargetCategory == "CandyPail" then
             State.PailsClaimed = State.PailsClaimed + 1
+        elseif State.PreviousTargetCategory == "LightningDrop" then
+            State.LightningClaimed = State.LightningClaimed + 1
+        elseif State.PreviousTargetCategory == "AirDrop" then
+            State.AirdropsClaimed = State.AirdropsClaimed + 1
         end
         State.PreviousTargetInstance = nil
         State.PreviousTargetCategory = nil
@@ -703,10 +752,10 @@ local function ScanForCollectibles()
         if not part then return end
 
         local category = nil
-        if IsCollectibleMatch(inst, CONFIG.MysteryCrate) then
-            category = "MysteryCrate"
-        elseif IsCollectibleMatch(inst, CONFIG.CandyPail) then
-            category = "CandyPail"
+        if IsCollectibleMatch(inst, CONFIG.MysteryCrate) then category = "MysteryCrate"
+        elseif IsCollectibleMatch(inst, CONFIG.CandyPail) then category = "CandyPail"
+        elseif IsCollectibleMatch(inst, CONFIG.LightningDrop) then category = "LightningDrop"
+        elseif IsCollectibleMatch(inst, CONFIG.AirDrop) then category = "AirDrop"
         end
 
         if category then
@@ -722,7 +771,7 @@ local function ScanForCollectibles()
         end
     end
 
-    for _, folderName in ipairs({"Crates", "MysteryCrates", "CandyPails", "Pails", "SpawnedCollectibles", "Spawns", "Debris"}) do
+    for _, folderName in ipairs({"Crates", "MysteryCrates", "CandyPails", "Pails", "SpawnedCollectibles", "Spawns", "Debris", "LightningDrops", "Airdrops"}) do
         local folder = workspace:FindFirstChild(folderName)
         if folder then
             for _, child in ipairs(folder:GetChildren()) do EvaluateInstance(child) end
@@ -1151,7 +1200,7 @@ local function BuildGUI()
     statsLabel.Font = Enum.Font.GothamBold
     statsLabel.TextSize = 11
     statsLabel.TextWrapped = true
-    statsLabel.Text = "Crates: 0 | Pails: 0 | Farm: 00:00 | Runtime: 00:00"
+    statsLabel.Text = "C:0 | P:0 | A:0 | L:0 | Farm: 00:00 | Run: 00:00"
     statsLabel.Parent = statsPanel
     State.StatsLabelRef = statsLabel
 
@@ -1206,8 +1255,18 @@ local function BuildGUI()
     filterBtn.MouseButton1Click:Connect(function()
         if State.CategoryFilter == "All" then State.CategoryFilter = "MysteryCrate"
         elseif State.CategoryFilter == "MysteryCrate" then State.CategoryFilter = "CandyPail"
+        elseif State.CategoryFilter == "CandyPail" then State.CategoryFilter = "LightningDrop"
+        elseif State.CategoryFilter == "LightningDrop" then State.CategoryFilter = "AirDrop"
         else State.CategoryFilter = "All" end
-        filterBtn.Text = "Filter: " .. (State.CategoryFilter == "All" and "All" or (State.CategoryFilter == "MysteryCrate" and "Crates" or "Pails"))
+        
+        local displayTxt = "All"
+        if State.CategoryFilter == "MysteryCrate" then displayTxt = "Crates"
+        elseif State.CategoryFilter == "CandyPail" then displayTxt = "Pails"
+        elseif State.CategoryFilter == "LightningDrop" then displayTxt = "Lightning"
+        elseif State.CategoryFilter == "AirDrop" then displayTxt = "Airdrops"
+        end
+        
+        filterBtn.Text = "Filter: " .. displayTxt
         PopulateFinderList()
     end)
 
@@ -1593,7 +1652,7 @@ PopulateFinderList = function()
         local emptyText = Instance.new("TextLabel")
         emptyText.Size = UDim2.new(1, 0, 0, 50)
         emptyText.BackgroundTransparency = 1
-        emptyText.Text = "No Crates or Candy Pails found.\nItems must spawn in Workspace."
+        emptyText.Text = "No items found for the current filter.\nItems must spawn in Workspace."
         emptyText.TextColor3 = Color3.fromRGB(150, 150, 160)
         emptyText.Font = Enum.Font.Gotham
         emptyText.TextSize = 12
@@ -1610,7 +1669,15 @@ PopulateFinderList = function()
 
         local colorBar = Instance.new("Frame")
         colorBar.Size = UDim2.new(0, 4, 1, 0)
-        colorBar.BackgroundColor3 = item.Category == "CandyPail" and CONFIG.CandyPail.Color or CONFIG.MysteryCrate.Color
+        
+        local col = Color3.new(1,1,1)
+        if item.Category == "CandyPail" then col = CONFIG.CandyPail.Color
+        elseif item.Category == "MysteryCrate" then col = CONFIG.MysteryCrate.Color
+        elseif item.Category == "LightningDrop" then col = CONFIG.LightningDrop.Color
+        elseif item.Category == "AirDrop" then col = CONFIG.AirDrop.Color
+        end
+        colorBar.BackgroundColor3 = col
+        
         colorBar.Parent = row
         CreateCorner(colorBar, 2)
 
@@ -1690,9 +1757,11 @@ local function Initialize()
             end
 
             State.StatsLabelRef.Text = string.format(
-                "Crates: %d | Pails: %d | Farm: %s | Runtime: %s",
+                "C:%d P:%d L:%d A:%d | Farm: %s | Run: %s",
                 State.CratesClaimed,
                 State.PailsClaimed,
+                State.LightningClaimed,
+                State.AirdropsClaimed,
                 FormatTime(autoFarmTime),
                 FormatTime(scriptRuntime)
             )
